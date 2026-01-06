@@ -3,20 +3,16 @@ import pandas as pd
 import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-import os
+from sklearn.impute import SimpleImputer
 
 app = Flask(__name__)
-
-@app.route('/', methods=['GET'])
-def health_check():
-    return jsonify({"status": "API de Carteira FIIs Online!"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
     try:
+        # 1. RECEBIMENTO E PARSING
         content = request.get_json()
         
-        # Lógica para suportar formato direto ou {dados: [], amount: 0}
         if isinstance(content, dict) and 'dados' in content:
             dados_json = content['dados']
             AMOUNT = float(content.get('amount', 5200))
@@ -27,15 +23,20 @@ def processar_carteira():
         if not dados_json:
             return jsonify({"error": "Nenhum dado recebido"}), 400
 
-        df = pd.DataFrame(dados_json)
+        fii = pd.DataFrame(dados_json)
 
-        # --- CONFIGURAÇÕES ---
-        CORTE_LIQUIDEZ = 200000       
-        CORTE_PATRIMONIO = 250000000  
+        # ==========================================================
+        # 2. CONFIGURAÇÃO DE PARÂMETROS (Igual ao script R)
+        # ==========================================================
+        CORTE_LIQUIDEZ = 200000
+        CORTE_PATRIMONIO = 250000000
+        CORTE_COTISTAS = 10000
         MIN_PVP = 0.70
         MAX_PVP = 1.20
-        MIN_DY_12M = 6.0              
-        CORTE_PRECO = 60.00           
+        MIN_ATIVOS = 3
+        MIN_DY_12M = 6.0  # Note: Javascript já converteu para float (ex: 6.0)
+        MIN_VAR_PAT = -10.0 # -0.10 no R, mas aqui os dados vêm em % (ex: -10)
+        CORTE_PRECO = 60.00
 
         PESOS_SETORIAIS = {
             "Híbridos e Outros": 0.20,
@@ -44,114 +45,154 @@ def processar_carteira():
             "Tijolo - Renda Urbana": 0.25
         }
 
-        # --- LIMPEZA ---
-        cols_num = ['preco', 'liquidez', 'pvp', 'dy_mensal', 'dy_ano', 'ultimo_div', 'patrimonio']
-        for col in cols_num:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-        # --- FILTROS ---
-        df_filtrado = df[
-            (df['liquidez'] >= CORTE_LIQUIDEZ) &
-            (df['patrimonio'] >= CORTE_PATRIMONIO) &
-            (df['pvp'] >= MIN_PVP) & (df['pvp'] <= MAX_PVP) &
-            (df['dy_ano'] >= MIN_DY_12M) &
-            (df['preco'] >= CORTE_PRECO)
+        # ==========================================================
+        # 3. FILTRAGEM E CATEGORIZAÇÃO (Tidyverse style)
+        # ==========================================================
+        
+        # Garante tipos numéricos e preenche NAs básicos com 0
+        fii = fii.fillna(0)
+        
+        # Filtros
+        fii = fii[
+            (fii['liquidez_diaria_r'] >= CORTE_LIQUIDEZ) &
+            (fii['patrimonio_liquido'] >= CORTE_PATRIMONIO) &
+            (fii['num_cotistas'] >= CORTE_COTISTAS) &
+            (fii['p_vp'] >= MIN_PVP) & (fii['p_vp'] <= MAX_PVP) &
+            (fii['dy_12m_acumulado'] >= MIN_DY_12M) &
+            (fii['quant_ativos'] >= MIN_ATIVOS) &
+            (fii['variacao_patrimonial'] > MIN_VAR_PAT) &
+            (fii['preco_atual_r'] >= CORTE_PRECO)
         ].copy()
 
-        if df_filtrado.empty:
-            return jsonify({"aviso": "Nenhum fundo passou nos filtros."}), 200
+        if fii.empty:
+            return jsonify({"aviso": "Nenhum fundo passou nos filtros de segurança."}), 200
 
-        # --- MACRO SETORES ---
-        def definir_macro_setor(setor):
-            setor = str(setor)
-            if setor in ["Papéis", "Serviços Financeiros Diversos"]:
-                return "Papel"
-            elif setor in ["Imóveis Industriais e Logísticos", "Logística"]:
-                return "Tijolo - Logística"
-            elif setor in ["Lajes Corporativas", "Agências de Bancos", "Educacional", 
-                           "Hospitalar", "Hotéis", "Imóveis Comerciais - Outros",
-                           "Exploração de Imóveis", "Shoppings", "Varejo", 
-                           "Tecidos. Vestuário e Calçados", "Imóveis Residenciais", 
-                           "Incorporações"]:
-                return "Tijolo - Renda Urbana"
-            else:
-                return "Híbridos e Outros"
+        # Criação do Macro Setor
+        def categorizar_setor(s):
+            if s in ["Papéis", "Serviços Financeiros Diversos"]: return "Papel"
+            if s in ["Imóveis Industriais e Logísticos", "Logística"]: return "Tijolo - Logística"
+            if s in ["Lajes Corporativas", "Agências de Bancos", "Educacional", "Hospitalar", 
+                     "Hotéis", "Imóveis Comerciais - Outros", "Exploração de Imóveis", 
+                     "Shoppings", "Varejo", "Tecidos. Vestuário e Calçados", 
+                     "Imóveis Residenciais", "Incorporações"]: return "Tijolo - Renda Urbana"
+            return "Híbridos e Outros"
 
-        df_filtrado['macro_setor'] = df_filtrado['setor'].apply(definir_macro_setor)
+        fii['macro_setor'] = fii['setor'].apply(categorizar_setor)
 
-        # --- TARGETS ---
-        targets = df_filtrado.groupby('macro_setor').agg({
-            'preco': 'min',       
-            'pvp': 'min',         
-            'liquidez': 'max',    
-            'ultimo_div': 'max',
-            'dy_mensal': 'max',
-            'dy_ano': 'max',
-            'patrimonio': 'max'
-        }).reset_index()
-
-        targets['ticker'] = "TGT_" + targets['macro_setor']
+        # ==========================================================
+        # 4. DEFINIÇÃO DO TARGET (Fundo Ideal por Setor)
+        # ==========================================================
         
-        # --- PCA ---
-        colunas_pca = ['preco', 'liquidez', 'pvp', 'dy_mensal', 'dy_ano', 'ultimo_div', 'patrimonio']
-        df_pca_input = pd.concat([df_filtrado, targets], ignore_index=True).fillna(0)
+        # Define quais colunas queremos MINIMIZAR e quais MAXIMIZAR
+        cols_min = ['preco_atual_r', 'p_vp', 'p_vpa', 'variacao_preco', 'volatilidade', 
+                    'tax_gestao', 'tax_performance', 'tax_administracao']
+        
+        cols_max = ['liquidez_diaria_r', 'ultimo_dividendo', 'dividend_yield', 
+                    'dy_3m_acumulado', 'dy_6m_acumulado', 'dy_12m_acumulado',
+                    'dy_3m_media', 'dy_6m_media', 'dy_12m_media', 'dy_ano',
+                    'dy_patrimonial', 'rentab_periodo', 'rentab_acumulada',
+                    'variacao_patrimonial', 'rentab_patr_periodo', 'rentab_patr_acumulada',
+                    'patrimonio_liquido', 'vpa', 'quant_ativos', 'num_cotistas']
 
-        X = df_pca_input[colunas_pca]
+        # Dicionário de agregação dinâmica
+        agg_dict = {c: 'min' for c in cols_min if c in fii.columns}
+        agg_dict.update({c: 'max' for c in cols_max if c in fii.columns})
+
+        # Cria os Targets
+        fii_ref_setorial = fii.groupby('macro_setor').agg(agg_dict).reset_index()
+        fii_ref_setorial['fundos'] = "TGT_" + fii_ref_setorial['macro_setor']
+        fii_ref_setorial['setor'] = fii_ref_setorial['macro_setor']
+
+        # Combina dados reais com targets
+        fii_combined = pd.concat([fii, fii_ref_setorial], ignore_index=True)
+
+        # ==========================================================
+        # 5. PCA E IMPUTAÇÃO (FactoMineR translation)
+        # ==========================================================
+        
+        # Seleciona apenas colunas numéricas para o PCA
+        numeric_cols = list(agg_dict.keys())
+        X = fii_combined[numeric_cols]
+
+        # Imputação (missMDA) -> Substituída por Média (Padrão Scikit-Learn)
+        imputer = SimpleImputer(strategy='mean')
+        X_imputed = imputer.fit_transform(X)
+
+        # Padronização (Scale = TRUE)
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        pca = PCA(n_components=None)
+        X_scaled = scaler.fit_transform(X_imputed)
+
+        # PCA
+        pca = PCA(n_components=None) # Inf components
         X_pca = pca.fit_transform(X_scaled)
-        weights = pca.explained_variance_ratio_
 
-        df_pca_input['pca_coords'] = list(X_pca)
+        # Pesos das dimensões (Variância Explicada)
+        eigenvalues_weights = pca.explained_variance_ratio_
 
-        # --- DISTÂNCIA ---
-        df_targets = df_pca_input[df_pca_input['ticker'].str.startswith('TGT_')].set_index('macro_setor')
-        df_funds = df_pca_input[~df_pca_input['ticker'].str.startswith('TGT_')].copy()
+        # Adiciona coordenadas ao DF
+        fii_combined['pca_coords'] = list(X_pca)
 
-        def calcular_distancia(row):
-            target_coords = df_targets.loc[row['macro_setor'], 'pca_coords']
-            my_coords = row['pca_coords']
-            sq_diff = (my_coords - target_coords) ** 2
-            weighted_dist = np.sqrt(np.sum(sq_diff * weights))
-            return round(weighted_dist, 2)
+        # ==========================================================
+        # 6. CÁLCULO DE DISTÂNCIA E SELEÇÃO
+        # ==========================================================
+        
+        targets_coords = fii_combined[fii_combined['fundos'].str.startswith('TGT_')].set_index('macro_setor')['pca_coords']
+        
+        # Apenas fundos reais
+        fii_real = fii_combined[~fii_combined['fundos'].str.startswith('TGT_')].copy()
 
-        df_funds['dist'] = df_funds.apply(calcular_distancia, axis=1)
+        def calc_weighted_dist(row):
+            target_vec = targets_coords[row['macro_setor']]
+            fund_vec = row['pca_coords']
+            # Distância Euclidiana Ponderada pelos Autovalores (pesos do PCA)
+            sq_diff = (fund_vec - target_vec) ** 2
+            # Equivalente ao script R que pondera pela variância
+            weighted_sq_diff = sq_diff * eigenvalues_weights 
+            return np.sqrt(np.sum(weighted_sq_diff))
 
-        # --- ALOCAÇÃO ---
-        finalistas = df_funds.sort_values('dist').groupby('macro_setor').head(3)
+        fii_real['dist'] = fii_real.apply(calc_weighted_dist, axis=1)
+
+        # ==========================================================
+        # 7. ALOCAÇÃO DE CARTEIRA
+        # ==========================================================
+        
+        finalistas = fii_real.sort_values('dist').groupby('macro_setor').head(3)
         carteira_final = []
 
         for setor, grupo in finalistas.groupby('macro_setor'):
-            peso_setor = PESOS_SETORIAIS.get(setor, 0)
-            budget_setor = AMOUNT * peso_setor
-            scores = 1 / (grupo['dist'] + 0.0001)
-            pesos_relativos = scores / scores.sum()
-            alocacao_reais = budget_setor * pesos_relativos
-            qtd_cotas = np.floor(alocacao_reais / grupo['preco'])
-            total_investido = qtd_cotas * grupo['preco']
+            peso_alvo = PESOS_SETORIAIS.get(setor, 0)
+            budget = AMOUNT * peso_alvo
             
-            resultado = grupo[['ticker', 'macro_setor', 'preco', 'dy_ano', 'pvp', 'dist']].copy()
-            resultado['qtd_cotas'] = qtd_cotas
-            resultado['total_investido'] = total_investido
-            carteira_final.append(resultado)
+            # Score inverso à distância (quanto menor a dist, maior o score)
+            scores = 1 / (grupo['dist'] + 1e-6)
+            pesos_rel = scores / scores.sum()
+            
+            alocacao = budget * pesos_rel
+            qtd = np.floor(alocacao / grupo['preco_atual_r'])
+            total = qtd * grupo['preco_atual_r']
+            
+            res = grupo[['fundos', 'macro_setor', 'preco_atual_r', 'dist', 'dy_12m_acumulado', 'p_vp']].copy()
+            res['qtd_cotas'] = qtd
+            res['total_investido'] = total
+            carteira_final.append(res)
 
-        if len(carteira_final) > 0:
-            df_carteira = pd.concat(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
-            return jsonify({
-                "carteira": df_carteira.to_dict(orient='records'),
-                "resumo": {
-                    "aporte": AMOUNT,
-                    "total_investido": round(df_carteira['total_investido'].sum(), 2)
-                }
-            })
-        else:
-             return jsonify({"aviso": "Erro ao gerar carteira"}), 200
+        if not carteira_final:
+             return jsonify({"aviso": "Não foi possível gerar carteira com os dados atuais."}), 200
+
+        df_final = pd.concat(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
+
+        return jsonify({
+            "carteira": df_final.to_dict(orient='records'),
+            "resumo": {
+                "aporte": AMOUNT,
+                "total_investido": round(df_final['total_investido'].sum(), 2),
+                "sobra": round(AMOUNT - df_final['total_investido'].sum(), 2)
+            }
+        })
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8000)
