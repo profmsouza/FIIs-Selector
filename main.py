@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "API FIIs Online", "versao": "2.0 Dinamica"})
+    return jsonify({"status": "API FIIs Online", "versao": "2.2 - Alocacao Granular"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
@@ -18,20 +18,24 @@ def processar_carteira():
         # 1. RECEBIMENTO E PARSING
         content = request.get_json()
         
-        # Garante que temos dados
         if not content:
             return jsonify({"error": "Nenhum JSON recebido"}), 400
 
-        # Lógica para extrair 'dados', 'amount' e 'pesos'
-        # Suporta o formato antigo (lista direta) ou novo (objeto completo)
         if isinstance(content, dict) and 'dados' in content:
             dados_json = content['dados']
-            AMOUNT = float(content.get('amount', 5200)) # Padrão 5200 se não vier
-            pesos_usuario = content.get('pesos', {})    # Padrão vazio se não vier
+            AMOUNT = float(content.get('amount', 5200))
+            
+            # Lógica Flexível para TOP_N: Pode ser Inteiro (3) ou Dict {"Papel": 2...}
+            raw_top_n = content.get('top_n', 3)
+            
+            # Se vier vazio ou None, assume 3
+            if not raw_top_n: raw_top_n = 3
+            
+            pesos_usuario = content.get('pesos', {})
         else:
-            # Fallback para compatibilidade se enviar a lista pura
             dados_json = content
             AMOUNT = 5200
+            raw_top_n = 3
             pesos_usuario = {}
 
         if not dados_json:
@@ -42,26 +46,16 @@ def processar_carteira():
         # ==========================================================
         # 2. DEFINIÇÃO DINÂMICA DE PESOS
         # ==========================================================
-        
-        # Pesos padrão (Caso o usuário não envie nada ou envie parcial)
         PESOS_PADRAO = {
             "Híbridos e Outros": 0.20,
             "Papel": 0.25,
             "Tijolo - Logística": 0.30,
             "Tijolo - Renda Urbana": 0.25
         }
-
-        # Atualiza os pesos padrão com o que veio da requisição
-        # Ex: Se o usuário mandar só {"Papel": 0.50}, o resto continua o padrão.
         PESOS_SETORIAIS = {**PESOS_PADRAO, **pesos_usuario}
 
-        # Opcional: Normalizar pesos para garantir que a soma dê 1 (100%)
-        total_pesos = sum(PESOS_SETORIAIS.values())
-        if total_pesos > 0:
-            PESOS_SETORIAIS = {k: v/total_pesos for k, v in PESOS_SETORIAIS.items()}
-
         # ==========================================================
-        # 3. CONFIGURAÇÃO DE FILTROS E VARIÁVEIS
+        # 3. FILTROS E VARIÁVEIS
         # ==========================================================
         CORTE_LIQUIDEZ = 200000
         CORTE_PATRIMONIO = 250000000
@@ -73,16 +67,11 @@ def processar_carteira():
         MIN_VAR_PAT = -10.0
         CORTE_PRECO = 60.00
 
-        # ==========================================================
-        # 4. TRATAMENTO DE DADOS (Pre-processing)
-        # ==========================================================
+        # Tratamento de NAs e Tipos
         fii = fii.fillna(0)
-        
-        # Converte colunas numéricas críticas para float (segurança extra)
         cols_numericas = ['liquidez_diaria_r', 'patrimonio_liquido', 'num_cotistas', 
                           'p_vp', 'dy_12m_acumulado', 'quant_ativos', 
                           'variacao_patrimonial', 'preco_atual_r']
-        
         for col in cols_numericas:
             if col in fii.columns:
                 fii[col] = pd.to_numeric(fii[col], errors='coerce').fillna(0)
@@ -102,7 +91,7 @@ def processar_carteira():
         if fii.empty:
             return jsonify({"aviso": "Nenhum fundo passou nos filtros de segurança."}), 200
 
-        # Categorização de Setores
+        # Categorização
         def categorizar_setor(s):
             s = str(s)
             if s in ["Papéis", "Serviços Financeiros Diversos"]: return "Papel"
@@ -116,12 +105,10 @@ def processar_carteira():
         fii['macro_setor'] = fii['setor'].apply(categorizar_setor)
 
         # ==========================================================
-        # 5. DEFINIÇÃO DO TARGET (Fundo Ideal)
+        # 4. DEFINIÇÃO DO TARGET
         # ==========================================================
-        
         cols_min = ['preco_atual_r', 'p_vp', 'p_vpa', 'variacao_preco', 'volatilidade', 
                     'tax_gestao', 'tax_performance', 'tax_administracao']
-        
         cols_max = ['liquidez_diaria_r', 'ultimo_dividendo', 'dividend_yield', 
                     'dy_3m_acumulado', 'dy_6m_acumulado', 'dy_12m_acumulado',
                     'dy_3m_media', 'dy_6m_media', 'dy_12m_media', 'dy_ano',
@@ -135,25 +122,21 @@ def processar_carteira():
         fii_ref_setorial = fii.groupby('macro_setor').agg(agg_dict).reset_index()
         fii_ref_setorial['fundos'] = "TGT_" + fii_ref_setorial['macro_setor']
         fii_ref_setorial['setor'] = fii_ref_setorial['macro_setor']
-
+        
         fii_combined = pd.concat([fii, fii_ref_setorial], ignore_index=True)
 
         # ==========================================================
-        # 6. PCA E DISTÂNCIA (Cérebro do Algoritmo)
+        # 5. PCA E DISTÂNCIA
         # ==========================================================
-        
         numeric_cols = list(agg_dict.keys())
         X = fii_combined[numeric_cols]
 
         imputer = SimpleImputer(strategy='mean')
         X_imputed = imputer.fit_transform(X)
-
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X_imputed)
-
         pca = PCA(n_components=None)
         X_pca = pca.fit_transform(X_scaled)
-
         eigenvalues_weights = pca.explained_variance_ratio_
         fii_combined['pca_coords'] = list(X_pca)
 
@@ -170,32 +153,48 @@ def processar_carteira():
         fii_real['dist'] = fii_real.apply(calc_weighted_dist, axis=1)
 
         # ==========================================================
-        # 7. ALOCAÇÃO FINANCEIRA (Usando os Pesos Dinâmicos)
+        # 7. ALOCAÇÃO (Lógica Granular de Top N)
         # ==========================================================
         
-        finalistas = fii_real.sort_values('dist').groupby('macro_setor').head(3)
         carteira_final = []
 
-        for setor, grupo in finalistas.groupby('macro_setor'):
-            # AQUI: Usa o peso vindo do JSON ou o padrão
-            peso_alvo = PESOS_SETORIAIS.get(setor, 0) 
+        # Itera sobre cada setor disponível nos dados
+        for setor, grupo in fii_real.groupby('macro_setor'):
+            
+            # --- LÓGICA DE DECISÃO DO N ---
+            n_para_este_setor = 3 # Padrão
+            
+            if isinstance(raw_top_n, dict):
+                # Se for dict, tenta pegar a chave do setor, se não tiver, usa 3
+                n_para_este_setor = int(raw_top_n.get(setor, 3))
+            else:
+                # Se for int (ex: 5), aplica para todos
+                n_para_este_setor = int(raw_top_n)
+
+            # Seleciona os Top N deste setor específico
+            # Se existirem menos fundos que N, pega todos (comportamento padrão do .head())
+            melhores_do_setor = grupo.sort_values('dist').head(n_para_este_setor)
+
+            # Define Orçamento do Setor
+            peso_alvo = PESOS_SETORIAIS.get(setor, 0)
             budget = AMOUNT * peso_alvo
             
-            if budget > 0: # Só aloca se tiver orçamento para o setor
-                scores = 1 / (grupo['dist'] + 1e-6)
+            if budget > 0 and not melhores_do_setor.empty:
+                # Score inverso à distância
+                scores = 1 / (melhores_do_setor['dist'] + 1e-6)
                 pesos_rel = scores / scores.sum()
                 
                 alocacao = budget * pesos_rel
-                qtd = np.floor(alocacao / grupo['preco_atual_r'])
-                total = qtd * grupo['preco_atual_r']
+                qtd = np.floor(alocacao / melhores_do_setor['preco_atual_r'])
+                total = qtd * melhores_do_setor['preco_atual_r']
                 
-                res = grupo[['fundos', 'macro_setor', 'preco_atual_r', 'dist', 'dy_12m_acumulado', 'p_vp']].copy()
+                res = melhores_do_setor[['fundos', 'macro_setor', 'preco_atual_r', 'dist', 'dy_12m_acumulado', 'p_vp']].copy()
                 res['qtd_cotas'] = qtd
                 res['total_investido'] = total
                 carteira_final.append(res)
 
         if not carteira_final:
-             return jsonify({"aviso": "Não foi possível gerar carteira (verifique os pesos ou filtros)."}), 200
+             return jsonify({"aviso": "Não foi possível gerar carteira com os dados atuais."}), 200
 
         df_final = pd.concat(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
 
@@ -203,7 +202,7 @@ def processar_carteira():
             "carteira": df_final.to_dict(orient='records'),
             "resumo": {
                 "aporte_inicial": AMOUNT,
-                "pesos_utilizados": PESOS_SETORIAIS,
+                "configuracao_top_n": raw_top_n,
                 "total_investido": round(df_final['total_investido'].sum(), 2),
                 "sobra_caixa": round(AMOUNT - df_final['total_investido'].sum(), 2)
             }
