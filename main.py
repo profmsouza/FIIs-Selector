@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "API FIIs Online", "versao": "2.3 - Gamification Mode"})
+    return jsonify({"status": "API FIIs Online", "versao": "2.4 - Gamification Stable"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
@@ -24,64 +24,59 @@ def processar_carteira():
         # Verifica se 'dados' existe (lista de FIIs vinda do n8n)
         dados_json = content.get('dados', [])
         if not dados_json and isinstance(content, list):
-             dados_json = content # Fallback se vier lista direta
+             dados_json = content 
 
         if not dados_json:
             return jsonify({"error": "O campo 'dados' está vazio ou inválido"}), 400
 
         # --- PARÂMETROS DO USUÁRIO ---
-        AMOUNT = float(content.get('amount', 5200))
+        try:
+            AMOUNT = float(content.get('amount', 5200))
+        except:
+            AMOUNT = 5200.0
+            
         raw_top_n = content.get('top_n', 3)
-        if not raw_top_n: raw_top_n = 3
         pesos_usuario = content.get('pesos', {})
-
-        # --- FILTROS DINÂMICOS (GAMIFICAÇÃO) ---
-        # Busca 'filtros' no JSON, se não achar, usa dicionário vazio e cai no default do get
         filtros_user = content.get('filtros', {})
 
+        # --- FILTROS & SAFETY DEFAULTS ---
         CORTE_LIQUIDEZ = float(filtros_user.get('liquidez', 200000))
         CORTE_PATRIMONIO = float(filtros_user.get('patrimonio', 250000000))
         CORTE_COTISTAS = int(filtros_user.get('cotistas', 10000))
         MIN_PVP = float(filtros_user.get('min_pvp', 0.70))
         MAX_PVP = float(filtros_user.get('max_pvp', 1.20))
         MIN_ATIVOS = int(filtros_user.get('min_ativos', 3))
-        MIN_DY_12M = float(filtros_user.get('min_dy', 6.0))
-        #input_dy = float(filtros_user.get('min_dy', 6.0))
-        #if input_dy < 1.0 and input_dy > 0: 
-            # Se veio 0.08, transformamos em 8.0 para bater com a base do FundsExplorer
-            #MIN_DY_12M = input_dy * 100 
-        #else:
-            #MIN_DY_12M = input_dy
         MIN_VAR_PAT = float(filtros_user.get('min_var_pat', -10.0))
-        CORTE_PRECO = float(filtros_user.get('max_preco', 60.00)) # Atenção: mudei lógica para MAX preço ou MIN?
-        # No seu original era >= CORTE_PRECO, vou manter a lógica original:
-        MIN_PRECO = float(filtros_user.get('min_preco', 60.00)) 
+        MIN_PRECO = float(filtros_user.get('min_preco', 60.00)) # Ajustado para MIN conforme seu código anterior
+
+        # ### CORREÇÃO 1: Descomentei e blindei a lógica de Escala do DY ###
+        input_dy = float(filtros_user.get('min_dy', 6.0))
+        # Se veio decimal (ex: 0.08) convertemos para percentual (8.0)
+        if input_dy < 1.0 and input_dy > 0: 
+            MIN_DY_12M = input_dy * 100 
+        else:
+            MIN_DY_12M = input_dy
 
         fii = pd.DataFrame(dados_json)
 
-        # ==========================================================
-        # 2. DEFINIÇÃO DINÂMICA DE PESOS
-        # ==========================================================
+        # 2. TRATAMENTO DE DADOS
         PESOS_PADRAO = {
-            "Híbridos e Outros": 0.20,
-            "Papel": 0.25,
-            "Tijolo - Logística": 0.30,
-            "Tijolo - Renda Urbana": 0.25
+            "Híbridos e Outros": 0.20, "Papel": 0.25,
+            "Tijolo - Logística": 0.30, "Tijolo - Renda Urbana": 0.25
         }
         PESOS_SETORIAIS = {**PESOS_PADRAO, **pesos_usuario}
 
         # Tratamento de NAs e Tipos
-        fii = fii.fillna(0)
+        fii = fii.fillna(0) # Primeiro fillna
         cols_numericas = ['liquidez_diaria_r', 'patrimonio_liquido', 'num_cotistas', 
                           'p_vp', 'dy_12m_acumulado', 'quant_ativos', 
                           'variacao_patrimonial', 'preco_atual_r']
+        
         for col in cols_numericas:
             if col in fii.columns:
                 fii[col] = pd.to_numeric(fii[col], errors='coerce').fillna(0)
 
-        # ==========================================================
-        # 3. APLICAÇÃO DOS FILTROS (AGORA DINÂMICOS)
-        # ==========================================================
+        # 3. APLICAÇÃO DOS FILTROS
         fii = fii[
             (fii['liquidez_diaria_r'] >= CORTE_LIQUIDEZ) &
             (fii['patrimonio_liquido'] >= CORTE_PATRIMONIO) &
@@ -94,13 +89,9 @@ def processar_carteira():
         ].copy()
 
         if fii.empty:
-            return jsonify({"aviso": "Nenhum fundo passou nos filtros selecionados. Tente relaxar as restrições."}), 200
+            return jsonify({"aviso": "Nenhum fundo passou nos filtros selecionados."}), 200
 
-        # ... (Mantém a lógica de Categorização, Target e PCA inalterada até o cálculo da distância) ...
-        # [CÓDIGO DE CATEGORIZAÇÃO E PCA AQUI - IGUAL AO ANTERIOR]
-        # Vou resumir para não estourar o limite, mas assuma que o bloco 4 e 5 estão aqui.
-        
-        # Recriando o bloco necessário para o contexto
+        # 4, 5, 6. CATEGORIZAÇÃO E PCA
         def categorizar_setor(s):
             s = str(s)
             if s in ["Papéis", "Serviços Financeiros Diversos"]: return "Papel"
@@ -126,6 +117,8 @@ def processar_carteira():
         fii_combined = pd.concat([fii, fii_ref_setorial], ignore_index=True)
         numeric_cols = list(agg_dict.keys())
         X = fii_combined[numeric_cols]
+        
+        # PCA Pipeline
         imputer = SimpleImputer(strategy='mean')
         X_imputed = imputer.fit_transform(X)
         scaler = StandardScaler()
@@ -147,58 +140,50 @@ def processar_carteira():
 
         fii_real['dist'] = fii_real.apply(calc_weighted_dist, axis=1)
 
-        # ==========================================================
-        # 7. ALOCAÇÃO E MATCH SCORE
-        # ==========================================================
+        # 7. ALOCAÇÃO
         carteira_final = []
 
         for setor, grupo in fii_real.groupby('macro_setor'):
             n_para_este_setor = int(raw_top_n.get(setor, 3)) if isinstance(raw_top_n, dict) else int(raw_top_n)
-            
             melhores_do_setor = grupo.sort_values('dist').head(n_para_este_setor)
-
             peso_alvo = PESOS_SETORIAIS.get(setor, 0)
             budget = AMOUNT * peso_alvo
             
             if budget > 0 and not melhores_do_setor.empty:
                 scores = 1 / (melhores_do_setor['dist'] + 1e-6)
                 pesos_rel = scores / scores.sum()
-                
                 alocacao = budget * pesos_rel
                 qtd = np.floor(alocacao / melhores_do_setor['preco_atual_r'])
                 total = qtd * melhores_do_setor['preco_atual_r']
                 
-                # --- CALCULO DO MATCH SCORE (Linear Relativo) ---
-                # Lógica: 
-                # Distância 0 (Perfeição) = 100%
-                # Maior distância encontrada neste setor (Pior da lista) = 0%
-                
+                # Calculo Match Score
                 max_dist_setor = melhores_do_setor['dist'].max()
-                
-                # Evita divisão por zero se todos os fundos forem perfeitos (dist=0)
                 if max_dist_setor == 0:
                     match_score_series = pd.Series(100.0, index=melhores_do_setor.index)
                 else:
-                    # Fórmula da Interpolação Linear Invertida
-                    # Score = 100 * (1 - (dist_atual / pior_dist_do_grupo))
                     match_score_series = 100 * (1 - (melhores_do_setor['dist'] / max_dist_setor))
                 
-                # Garante que não fique negativo (caso raro de arredondamento)
                 match_score_series = match_score_series.clip(lower=0)
-
+                
                 res = melhores_do_setor[['fundos', 'macro_setor', 'preco_atual_r', 'dist', 'dy_12m_acumulado', 'p_vp']].copy()
                 res['qtd_cotas'] = qtd
                 res['total_investido'] = total
                 res['match_score'] = match_score_series.round(1) 
-
                 carteira_final.append(res)
 
         if not carteira_final:
              return jsonify({"aviso": "Não foi possível alocar capital."}), 200
 
         df_final = pd.concat(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
-        INVESTIMENTO = round(df_final['total_investido'].sum(), 2)
-        SOBRA = AMOUNT - INVESTIMENTO
+        
+        # ### CORREÇÃO 2: SANITIZAÇÃO DE JSON ###
+        # O Pandas pode gerar NaN ou Infinity que quebram o n8n.
+        # Substituímos Infinito por 0 e NaN por 0 (ou None)
+        df_final = df_final.replace([np.inf, -np.inf], 0)
+        df_final = df_final.fillna(0)
+
+        INVESTIMENTO = round(float(df_final['total_investido'].sum()), 2)
+        SOBRA = round(AMOUNT - INVESTIMENTO, 2)
 
         return jsonify({
             "carteira": df_final.to_dict(orient='records'),
@@ -206,11 +191,13 @@ def processar_carteira():
                 "aporte_inicial": AMOUNT,
                 "total_investido": INVESTIMENTO,
                 "sobra_caixa": SOBRA,
-                "filtros_utilizados": filtros_user # Retorna para feedback visual
+                "filtros_utilizados": filtros_user
             }
         })
 
     except Exception as e:
+        # Imprime no log do servidor para você ver o erro real se acontecer
+        print(traceback.format_exc()) 
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 if __name__ == "__main__":
