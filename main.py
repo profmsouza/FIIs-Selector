@@ -45,12 +45,13 @@ def processar_carteira():
         MIN_PVP = float(filtros_user.get('min_pvp', 0.70))
         MAX_PVP = float(filtros_user.get('max_pvp', 1.20))
         MIN_ATIVOS = int(filtros_user.get('min_ativos', 3))
-        input_dy = float(filtros_user.get('min_dy', 6.0))
-        if input_dy < 1.0 and input_dy > 0: 
+        MIN_DY_12M = float(filtros_user.get('min_dy', 6.0))
+        #input_dy = float(filtros_user.get('min_dy', 6.0))
+        #if input_dy < 1.0 and input_dy > 0: 
             # Se veio 0.08, transformamos em 8.0 para bater com a base do FundsExplorer
-            MIN_DY_12M = input_dy * 100 
-        else:
-            MIN_DY_12M = input_dy
+            #MIN_DY_12M = input_dy * 100 
+        #else:
+            #MIN_DY_12M = input_dy
         MIN_VAR_PAT = float(filtros_user.get('min_var_pat', -10.0))
         CORTE_PRECO = float(filtros_user.get('max_preco', 60.00)) # Atenção: mudei lógica para MAX preço ou MIN?
         # No seu original era >= CORTE_PRECO, vou manter a lógica original:
