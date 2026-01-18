@@ -45,7 +45,12 @@ def processar_carteira():
         MIN_PVP = float(filtros_user.get('min_pvp', 0.70))
         MAX_PVP = float(filtros_user.get('max_pvp', 1.20))
         MIN_ATIVOS = int(filtros_user.get('min_ativos', 3))
-        MIN_DY_12M = float(filtros_user.get('min_dy', 6.0))
+        input_dy = float(filtros_user.get('min_dy', 6.0))
+        if input_dy < 1.0 and input_dy > 0: 
+            # Se veio 0.08, transformamos em 8.0 para bater com a base do FundsExplorer
+            MIN_DY_12M = input_dy * 100 
+        else:
+            MIN_DY_12M = input_dy
         MIN_VAR_PAT = float(filtros_user.get('min_var_pat', -10.0))
         CORTE_PRECO = float(filtros_user.get('max_preco', 60.00)) # Atenção: mudei lógica para MAX preço ou MIN?
         # No seu original era >= CORTE_PRECO, vou manter a lógica original:
@@ -162,16 +167,28 @@ def processar_carteira():
                 qtd = np.floor(alocacao / melhores_do_setor['preco_atual_r'])
                 total = qtd * melhores_do_setor['preco_atual_r']
                 
-                # --- CALCULO DO MATCH SCORE (0 a 100%) ---
-                # A lógica: Se dist=0, score=100. Conforme dist aumenta, score cai.
-                # Ajuste o 'fator_sensibilidade' se quiser que o score caia mais rápido ou devagar.
-                fator_sensibilidade = 1 
-                match_score_series = 100 * (1 / (1 + (melhores_do_setor['dist'] * fator_sensibilidade)))
+                # --- CALCULO DO MATCH SCORE (Linear Relativo) ---
+                # Lógica: 
+                # Distância 0 (Perfeição) = 100%
+                # Maior distância encontrada neste setor (Pior da lista) = 0%
+                
+                max_dist_setor = melhores_do_setor['dist'].max()
+                
+                # Evita divisão por zero se todos os fundos forem perfeitos (dist=0)
+                if max_dist_setor == 0:
+                    match_score_series = pd.Series(100.0, index=melhores_do_setor.index)
+                else:
+                    # Fórmula da Interpolação Linear Invertida
+                    # Score = 100 * (1 - (dist_atual / pior_dist_do_grupo))
+                    match_score_series = 100 * (1 - (melhores_do_setor['dist'] / max_dist_setor))
+                
+                # Garante que não fique negativo (caso raro de arredondamento)
+                match_score_series = match_score_series.clip(lower=0)
 
                 res = melhores_do_setor[['fundos', 'macro_setor', 'preco_atual_r', 'dist', 'dy_12m_acumulado', 'p_vp']].copy()
                 res['qtd_cotas'] = qtd
                 res['total_investido'] = total
-                res['match_score'] = match_score_series.round(1) # Ex: 95.5%
+                res['match_score'] = match_score_series.round(1) 
 
                 carteira_final.append(res)
 
