@@ -179,12 +179,15 @@ def processar_carteira():
              return jsonify({"aviso": "Não foi possível alocar capital."}), 200
 
         df_final = pd.concat(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
+        INVESTIMENTO = round(df_final['total_investido'].sum(), 2)
+        SOBRA = AMOUNT - INVESTIMENTO
 
         return jsonify({
             "carteira": df_final.to_dict(orient='records'),
             "resumo": {
                 "aporte_inicial": AMOUNT,
-                "total_investido": round(df_final['total_investido'].sum(), 2),
+                "total_investido": INVESTIMENTO,
+                "sobra_caixa": SOBRA,
                 "filtros_utilizados": filtros_user # Retorna para feedback visual
             }
         })
