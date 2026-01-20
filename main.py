@@ -11,9 +11,12 @@ import json
 
 app = Flask(__name__)
 
+# --- CONFIGURAÇÃO FIXA ---
+TOP_N_CANDIDATES = 10 # Tamanho da "Shortlist" do PCA para o Solver analisar
+
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "API FIIs Online", "versao": "3.1 - Fix Ticker/Fundos"})
+    return jsonify({"status": "API FIIs Online", "versao": "3.4 - Hybrid Fixed Top10"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
@@ -27,7 +30,7 @@ def processar_carteira():
         # Verifica se 'dados' existe
         dados_json = content.get('dados', [])
         
-        # Correção para n8n: Se dados vier como string, faz o parse
+        # Correção para n8n
         if isinstance(dados_json, str):
             try:
                 dados_json = json.loads(dados_json)
@@ -55,10 +58,11 @@ def processar_carteira():
             except:
                 return default
 
-        # --- PARÂMETROS DO USUÁRIO (Blindados) ---
-        AMOUNT = safe_float(content.get('amount'), 5200.0)
-            
-        raw_top_n = content.get('top_n', 50) 
+        # --- PARÂMETROS DO USUÁRIO ---
+        AMOUNT = safe_float(content.get('amount'), 1000.0)
+        
+        # Nota: top_n removido dos parâmetros. Usaremos a constante TOP_N_CANDIDATES.
+        
         pesos_usuario = content.get('pesos', {})
         filtros_user = content.get('filtros', {})
 
@@ -82,11 +86,9 @@ def processar_carteira():
         fii = pd.DataFrame(dados_json)
 
         # === CORREÇÃO DO ERRO KEYERROR: 'TICKER' ===
-        # O n8n manda 'fundos', mas o script usa 'ticker'. Normalizamos aqui.
         if 'ticker' not in fii.columns and 'fundos' in fii.columns:
             fii = fii.rename(columns={'fundos': 'ticker'})
         
-        # Se ainda assim não tiver ticker, criamos um dummy para não quebrar (embora o ideal seja falhar)
         if 'ticker' not in fii.columns:
              return jsonify({"error": "A coluna 'fundos' ou 'ticker' não foi encontrada nos dados."}), 400
         # ===========================================
@@ -173,7 +175,7 @@ def processar_carteira():
 
         fii_real['dist'] = fii_real.apply(calc_weighted_dist, axis=1)
 
-        # 7. ALOCAÇÃO OTIMIZADA VIA SOLVER
+        # 7. ALOCAÇÃO OTIMIZADA (PCA Shortlist -> Solver Max Yield)
         carteira_final = []
 
         for setor, grupo in fii_real.groupby('macro_setor'):
@@ -181,13 +183,19 @@ def processar_carteira():
             peso_alvo = PESOS_SETORIAIS.get(setor, 0)
             budget_disponivel = AMOUNT * peso_alvo
             
-            # Filtro de Qualidade PCA (Top 50)
-            pool_candidatos = grupo.sort_values('dist').head(50).copy()
+            # --- SHORTLIST PCA ---
+            # Seleciona os Top 10 ativos mais próximos do "Ideal"
+            pool_candidatos = grupo.sort_values('dist').head(TOP_N_CANDIDATES).copy()
+            
+            # Removemos fundos sem yield
             pool_candidatos = pool_candidatos[pool_candidatos['dy_12m_acumulado'] > 0]
 
             if budget_disponivel <= 0 or pool_candidatos.empty:
                 continue
 
+            # --- SOLVER ---
+            # O Solver recebe essa lista de elite (até 10 ativos) e decide as quantidades
+            # para maximizar o retorno em R$
             prob = LpProblem(f"Knapsack_{setor}", LpMaximize)
             
             tickers = pool_candidatos['ticker'].tolist()
@@ -218,7 +226,7 @@ def processar_carteira():
                          match_score = (100 * (1 - (row['dist'] / max_dist_setor))).round(1)
 
                     res = {
-                        'fundos': t, # O ticker corrigido
+                        'fundos': t,
                         'macro_setor': setor,
                         'preco_atual_r': row['preco_atual_r'],
                         'dy_12m_acumulado': row['dy_12m_acumulado'],
@@ -249,7 +257,7 @@ def processar_carteira():
                 "total_investido": INVESTIMENTO,
                 "sobra_caixa": SOBRA,
                 "dy_medio_carteira": round(dy_ponderado, 2),
-                "metodo": "Otimização Linear (Knapsack Problem)",
+                "metodo": "Híbrido: Top 10 PCA + Solver Knapsack",
                 "filtros_utilizados": filtros_user
             }
         })
