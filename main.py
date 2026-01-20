@@ -12,11 +12,11 @@ import json
 app = Flask(__name__)
 
 # --- CONFIGURAÇÃO FIXA ---
-TOP_N_CANDIDATES = 10 # Tamanho da "Shortlist" do PCA para o Solver analisar
+TOP_N_CANDIDATES = 10 
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "API FIIs Online", "versao": "3.4 - Hybrid Fixed Top10"})
+    return jsonify({"status": "API FIIs Online", "versao": "3.5 - Fix NaN Mask Error"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
@@ -30,7 +30,6 @@ def processar_carteira():
         # Verifica se 'dados' existe
         dados_json = content.get('dados', [])
         
-        # Correção para n8n
         if isinstance(dados_json, str):
             try:
                 dados_json = json.loads(dados_json)
@@ -41,7 +40,7 @@ def processar_carteira():
              dados_json = content 
 
         if not dados_json:
-            return jsonify({"error": "O campo 'dados' está vazio ou inválido. Verifique o node do n8n."}), 400
+            return jsonify({"error": "O campo 'dados' está vazio ou inválido."}), 400
 
         # Funções de Segurança
         def safe_float(val, default):
@@ -58,11 +57,8 @@ def processar_carteira():
             except:
                 return default
 
-        # --- PARÂMETROS DO USUÁRIO ---
-        AMOUNT = safe_float(content.get('amount'), 1000.0)
-        
-        # Nota: top_n removido dos parâmetros. Usaremos a constante TOP_N_CANDIDATES.
-        
+        # --- PARÂMETROS ---
+        AMOUNT = safe_float(content.get('amount'), 5200.0)
         pesos_usuario = content.get('pesos', {})
         filtros_user = content.get('filtros', {})
 
@@ -85,13 +81,15 @@ def processar_carteira():
         # 2. TRATAMENTO DE DADOS
         fii = pd.DataFrame(dados_json)
 
-        # === CORREÇÃO DO ERRO KEYERROR: 'TICKER' ===
+        # Padronização de Colunas (Fundos -> Ticker)
         if 'ticker' not in fii.columns and 'fundos' in fii.columns:
             fii = fii.rename(columns={'fundos': 'ticker'})
         
         if 'ticker' not in fii.columns:
              return jsonify({"error": "A coluna 'fundos' ou 'ticker' não foi encontrada nos dados."}), 400
-        # ===========================================
+        
+        # Garante que ticker é string e remove vazios
+        fii['ticker'] = fii['ticker'].astype(str).str.strip()
 
         PESOS_PADRAO = {
             "Híbridos e Outros": 0.20, "Papel": 0.25,
@@ -99,7 +97,6 @@ def processar_carteira():
         }
         PESOS_SETORIAIS = {**PESOS_PADRAO, **pesos_usuario}
 
-        # Tratamento de NAs e Tipos
         fii = fii.fillna(0)
         cols_numericas = ['liquidez_diaria_r', 'patrimonio_liquido', 'num_cotistas', 
                           'p_vp', 'dy_12m_acumulado', 'quant_ativos', 
@@ -147,7 +144,8 @@ def processar_carteira():
         agg_dict.update({c: 'max' for c in cols_max if c in fii.columns})
 
         fii_ref_setorial = fii.groupby('macro_setor').agg(agg_dict).reset_index()
-        fii_ref_setorial['fundos'] = "TGT_" + fii_ref_setorial['macro_setor']
+        # [CORREÇÃO AQUI]: Usamos 'ticker' para o target também, evitando colunas duplicadas com NaN
+        fii_ref_setorial['ticker'] = "TGT_" + fii_ref_setorial['macro_setor']
         fii_ref_setorial['setor'] = fii_ref_setorial['macro_setor']
         
         fii_combined = pd.concat([fii, fii_ref_setorial], ignore_index=True)
@@ -163,8 +161,11 @@ def processar_carteira():
         eigenvalues_weights = pca.explained_variance_ratio_
         fii_combined['pca_coords'] = list(X_pca)
 
-        targets_coords = fii_combined[fii_combined['fundos'].str.startswith('TGT_')].set_index('macro_setor')['pca_coords']
-        fii_real = fii_combined[~fii_combined['fundos'].str.startswith('TGT_')].copy()
+        # [CORREÇÃO AQUI]: Garantimos que não há NaNs na coluna ticker antes do startswith
+        fii_combined['ticker'] = fii_combined['ticker'].fillna('')
+        
+        targets_coords = fii_combined[fii_combined['ticker'].str.startswith('TGT_')].set_index('macro_setor')['pca_coords']
+        fii_real = fii_combined[~fii_combined['ticker'].str.startswith('TGT_')].copy()
 
         def calc_weighted_dist(row):
             target_vec = targets_coords[row['macro_setor']]
@@ -175,7 +176,7 @@ def processar_carteira():
 
         fii_real['dist'] = fii_real.apply(calc_weighted_dist, axis=1)
 
-        # 7. ALOCAÇÃO OTIMIZADA (PCA Shortlist -> Solver Max Yield)
+        # 7. ALOCAÇÃO
         carteira_final = []
 
         for setor, grupo in fii_real.groupby('macro_setor'):
@@ -183,19 +184,14 @@ def processar_carteira():
             peso_alvo = PESOS_SETORIAIS.get(setor, 0)
             budget_disponivel = AMOUNT * peso_alvo
             
-            # --- SHORTLIST PCA ---
-            # Seleciona os Top 10 ativos mais próximos do "Ideal"
+            # Shortlist PCA
             pool_candidatos = grupo.sort_values('dist').head(TOP_N_CANDIDATES).copy()
-            
-            # Removemos fundos sem yield
             pool_candidatos = pool_candidatos[pool_candidatos['dy_12m_acumulado'] > 0]
 
             if budget_disponivel <= 0 or pool_candidatos.empty:
                 continue
 
-            # --- SOLVER ---
-            # O Solver recebe essa lista de elite (até 10 ativos) e decide as quantidades
-            # para maximizar o retorno em R$
+            # Solver Knapsack
             prob = LpProblem(f"Knapsack_{setor}", LpMaximize)
             
             tickers = pool_candidatos['ticker'].tolist()
