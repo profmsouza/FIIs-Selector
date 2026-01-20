@@ -7,12 +7,13 @@ from sklearn.impute import SimpleImputer
 # BIBLIOTECA DE PESQUISA OPERACIONAL
 from pulp import LpMaximize, LpProblem, LpVariable, lpSum, PULP_CBC_CMD, value
 import traceback
+import json
 
 app = Flask(__name__)
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "API FIIs Online", "versao": "3.0 - Solver Max Yield"})
+    return jsonify({"status": "API FIIs Online", "versao": "3.1 - Fix Ticker/Fundos"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
@@ -23,46 +24,73 @@ def processar_carteira():
         if not content:
             return jsonify({"error": "Nenhum JSON recebido"}), 400
 
-        # Verifica se 'dados' existe (lista de FIIs vinda do n8n)
+        # Verifica se 'dados' existe
         dados_json = content.get('dados', [])
+        
+        # Correção para n8n: Se dados vier como string, faz o parse
+        if isinstance(dados_json, str):
+            try:
+                dados_json = json.loads(dados_json)
+            except:
+                dados_json = []
+
         if not dados_json and isinstance(content, list):
              dados_json = content 
 
         if not dados_json:
-            return jsonify({"error": "O campo 'dados' está vazio ou inválido"}), 400
+            return jsonify({"error": "O campo 'dados' está vazio ou inválido. Verifique o node do n8n."}), 400
 
-        # --- PARÂMETROS DO USUÁRIO ---
-        try:
-            AMOUNT = float(content.get('amount', 5200))
-        except:
-            AMOUNT = 5200.0
+        # Funções de Segurança
+        def safe_float(val, default):
+            try:
+                if val is None or val == "": return default
+                return float(val)
+            except:
+                return default
+
+        def safe_int(val, default):
+            try:
+                if val is None or val == "": return default
+                return int(float(val))
+            except:
+                return default
+
+        # --- PARÂMETROS DO USUÁRIO (Blindados) ---
+        AMOUNT = safe_float(content.get('amount'), 5200.0)
             
-        # Nota: raw_top_n agora serve apenas como um 'soft limit' visual ou fallback, 
-        # pois o solver decide a quantidade ideal.
         raw_top_n = content.get('top_n', 50) 
         pesos_usuario = content.get('pesos', {})
         filtros_user = content.get('filtros', {})
 
-        # --- FILTROS & SAFETY DEFAULTS ---
-        CORTE_LIQUIDEZ = float(filtros_user.get('liquidez', 200000))
-        CORTE_PATRIMONIO = float(filtros_user.get('patrimonio', 250000000))
-        CORTE_COTISTAS = int(filtros_user.get('cotistas', 10000))
-        MIN_PVP = float(filtros_user.get('min_pvp', 0.70))
-        MAX_PVP = float(filtros_user.get('max_pvp', 1.20))
-        MIN_ATIVOS = int(filtros_user.get('min_ativos', 3))
-        MIN_VAR_PAT = float(filtros_user.get('min_var_pat', -10.0))
-        MIN_PRECO = float(filtros_user.get('min_preco', 60.00))
+        # --- FILTROS ---
+        CORTE_LIQUIDEZ = safe_float(filtros_user.get('liquidez'), 200000.0)
+        CORTE_PATRIMONIO = safe_float(filtros_user.get('patrimonio'), 250000000.0)
+        CORTE_COTISTAS = safe_int(filtros_user.get('cotistas'), 10000)
+        MIN_PVP = safe_float(filtros_user.get('min_pvp'), 0.70)
+        MAX_PVP = safe_float(filtros_user.get('max_pvp'), 1.20)
+        MIN_ATIVOS = safe_int(filtros_user.get('min_ativos'), 3)
+        MIN_VAR_PAT = safe_float(filtros_user.get('min_var_pat'), -10.0)
+        MIN_PRECO = safe_float(filtros_user.get('min_preco'), 60.00)
 
-        # Lógica de Escala do DY
-        input_dy = float(filtros_user.get('min_dy', 6.0))
+        input_dy = safe_float(filtros_user.get('min_dy'), 6.0)
         if input_dy < 1.0 and input_dy > 0: 
             MIN_DY_12M = input_dy * 100 
         else:
             MIN_DY_12M = input_dy
 
+        # 2. TRATAMENTO DE DADOS
         fii = pd.DataFrame(dados_json)
 
-        # 2. TRATAMENTO DE DADOS
+        # === CORREÇÃO DO ERRO KEYERROR: 'TICKER' ===
+        # O n8n manda 'fundos', mas o script usa 'ticker'. Normalizamos aqui.
+        if 'ticker' not in fii.columns and 'fundos' in fii.columns:
+            fii = fii.rename(columns={'fundos': 'ticker'})
+        
+        # Se ainda assim não tiver ticker, criamos um dummy para não quebrar (embora o ideal seja falhar)
+        if 'ticker' not in fii.columns:
+             return jsonify({"error": "A coluna 'fundos' ou 'ticker' não foi encontrada nos dados."}), 400
+        # ===========================================
+
         PESOS_PADRAO = {
             "Híbridos e Outros": 0.20, "Papel": 0.25,
             "Tijolo - Logística": 0.30, "Tijolo - Renda Urbana": 0.25
@@ -79,7 +107,6 @@ def processar_carteira():
             if col in fii.columns:
                 fii[col] = pd.to_numeric(fii[col], errors='coerce').fillna(0)
 
-        # Garante que temos ultimo_dividendo (se não tiver, estima pelo DY)
         if 'ultimo_dividendo' not in fii.columns or fii['ultimo_dividendo'].sum() == 0:
              fii['ultimo_dividendo'] = (fii['preco_atual_r'] * (fii['dy_12m_acumulado'] / 100)) / 12
 
@@ -98,7 +125,7 @@ def processar_carteira():
         if fii.empty:
             return jsonify({"aviso": "Nenhum fundo passou nos filtros selecionados."}), 200
 
-        # 4, 5, 6. CATEGORIZAÇÃO E PCA (QUALIDADE DO ATIVO)
+        # 4, 5, 6. CATEGORIZAÇÃO E PCA
         def categorizar_setor(s):
             s = str(s)
             if s in ["Papéis", "Serviços Financeiros Diversos"]: return "Papel"
@@ -125,7 +152,6 @@ def processar_carteira():
         numeric_cols = list(agg_dict.keys())
         X = fii_combined[numeric_cols]
         
-        # PCA Pipeline
         imputer = SimpleImputer(strategy='mean')
         X_imputed = imputer.fit_transform(X)
         scaler = StandardScaler()
@@ -147,56 +173,37 @@ def processar_carteira():
 
         fii_real['dist'] = fii_real.apply(calc_weighted_dist, axis=1)
 
-        # ==============================================================================
-        # 7. ALOCAÇÃO OTIMIZADA VIA SOLVER (Knapsack Problem por Setor)
-        # ==============================================================================
-        
+        # 7. ALOCAÇÃO OTIMIZADA VIA SOLVER
         carteira_final = []
 
         for setor, grupo in fii_real.groupby('macro_setor'):
             
-            # 7.1 Define o Budget do Setor
             peso_alvo = PESOS_SETORIAIS.get(setor, 0)
             budget_disponivel = AMOUNT * peso_alvo
             
-            # 7.2 Seleciona Candidatos (Filtro de Qualidade PCA)
-            # Pegamos os top 50 fundos mais "perfeitos" matematicamente.
-            # O Solver escolherá o time titular dentre esses 50.
+            # Filtro de Qualidade PCA (Top 50)
             pool_candidatos = grupo.sort_values('dist').head(50).copy()
-            
-            # Removemos fundos que não pagam dividendos (objetivo é renda)
             pool_candidatos = pool_candidatos[pool_candidatos['dy_12m_acumulado'] > 0]
 
             if budget_disponivel <= 0 or pool_candidatos.empty:
                 continue
 
-            # 7.3 Configura o Problema de Otimização
             prob = LpProblem(f"Knapsack_{setor}", LpMaximize)
             
             tickers = pool_candidatos['ticker'].tolist()
             precos = pool_candidatos.set_index('ticker')['preco_atual_r'].to_dict()
             
-            # Calculamos o retorno FINANCEIRO esperado por cota (em R$)
-            # Usando DY anual para projeção: R$ Retorno = Preço * (DY% / 100)
             retorno_em_reais = {}
             for t, row in pool_candidatos.set_index('ticker').iterrows():
                 retorno_em_reais[t] = row['preco_atual_r'] * (row['dy_12m_acumulado'] / 100)
 
-            # Variáveis de Decisão: Quantidade de cotas (Inteiro >= 0)
             qtd_vars = LpVariable.dicts("Qtd", tickers, lowBound=0, cat='Integer')
 
-            # --- FUNÇÃO OBJETIVO ---
-            # Maximizar o total de dinheiro recebido em dividendos (Renda Passiva)
             prob += lpSum([qtd_vars[t] * retorno_em_reais[t] for t in tickers])
-
-            # --- RESTRIÇÃO DE ORÇAMENTO ---
-            # A soma das compras não pode exceder o budget do setor
             prob += lpSum([qtd_vars[t] * precos[t] for t in tickers]) <= budget_disponivel
 
-            # Resolve o problema (Silencioso)
             prob.solve(PULP_CBC_CMD(msg=False))
 
-            # 7.4 Compilação dos Resultados
             max_dist_setor = pool_candidatos['dist'].max()
             
             for t in tickers:
@@ -206,14 +213,12 @@ def processar_carteira():
                     row = pool_candidatos[pool_candidatos['ticker'] == t].iloc[0]
                     total_alocado = qtd_otima * row['preco_atual_r']
                     
-                    # Score Visual (Informativo apenas)
                     match_score = 100.0
                     if max_dist_setor > 0:
                          match_score = (100 * (1 - (row['dist'] / max_dist_setor))).round(1)
 
                     res = {
-                        'fundos': row['fundos'],
-                        'ticker': t,
+                        'fundos': t, # O ticker corrigido
                         'macro_setor': setor,
                         'preco_atual_r': row['preco_atual_r'],
                         'dy_12m_acumulado': row['dy_12m_acumulado'],
@@ -228,14 +233,11 @@ def processar_carteira():
              return jsonify({"aviso": "Não foi possível alocar capital."}), 200
 
         df_final = pd.DataFrame(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
-        
-        # Sanitização Final
         df_final = df_final.replace([np.inf, -np.inf], 0).fillna(0)
 
         INVESTIMENTO = round(float(df_final['total_investido'].sum()), 2)
         SOBRA = round(AMOUNT - INVESTIMENTO, 2)
         
-        # Dy Médio Ponderado
         dy_ponderado = 0
         if INVESTIMENTO > 0:
             dy_ponderado = (df_final['dy_12m_acumulado'] * df_final['total_investido']).sum() / INVESTIMENTO
