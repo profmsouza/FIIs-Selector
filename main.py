@@ -4,13 +4,15 @@ import numpy as np
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
+# BIBLIOTECA DE PESQUISA OPERACIONAL
+from pulp import LpMaximize, LpProblem, LpVariable, lpSum, PULP_CBC_CMD, value
 import traceback
 
 app = Flask(__name__)
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "API FIIs Online", "versao": "2.4 - Gamification Stable"})
+    return jsonify({"status": "API FIIs Online", "versao": "3.0 - Solver Max Yield"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
@@ -35,7 +37,9 @@ def processar_carteira():
         except:
             AMOUNT = 5200.0
             
-        raw_top_n = content.get('top_n', 3)
+        # Nota: raw_top_n agora serve apenas como um 'soft limit' visual ou fallback, 
+        # pois o solver decide a quantidade ideal.
+        raw_top_n = content.get('top_n', 50) 
         pesos_usuario = content.get('pesos', {})
         filtros_user = content.get('filtros', {})
 
@@ -47,11 +51,10 @@ def processar_carteira():
         MAX_PVP = float(filtros_user.get('max_pvp', 1.20))
         MIN_ATIVOS = int(filtros_user.get('min_ativos', 3))
         MIN_VAR_PAT = float(filtros_user.get('min_var_pat', -10.0))
-        MIN_PRECO = float(filtros_user.get('min_preco', 60.00)) # Ajustado para MIN conforme seu código anterior
+        MIN_PRECO = float(filtros_user.get('min_preco', 60.00))
 
-        # ### CORREÇÃO 1: Descomentei e blindei a lógica de Escala do DY ###
+        # Lógica de Escala do DY
         input_dy = float(filtros_user.get('min_dy', 6.0))
-        # Se veio decimal (ex: 0.08) convertemos para percentual (8.0)
         if input_dy < 1.0 and input_dy > 0: 
             MIN_DY_12M = input_dy * 100 
         else:
@@ -67,14 +70,18 @@ def processar_carteira():
         PESOS_SETORIAIS = {**PESOS_PADRAO, **pesos_usuario}
 
         # Tratamento de NAs e Tipos
-        fii = fii.fillna(0) # Primeiro fillna
+        fii = fii.fillna(0)
         cols_numericas = ['liquidez_diaria_r', 'patrimonio_liquido', 'num_cotistas', 
                           'p_vp', 'dy_12m_acumulado', 'quant_ativos', 
-                          'variacao_patrimonial', 'preco_atual_r']
+                          'variacao_patrimonial', 'preco_atual_r', 'ultimo_dividendo']
         
         for col in cols_numericas:
             if col in fii.columns:
                 fii[col] = pd.to_numeric(fii[col], errors='coerce').fillna(0)
+
+        # Garante que temos ultimo_dividendo (se não tiver, estima pelo DY)
+        if 'ultimo_dividendo' not in fii.columns or fii['ultimo_dividendo'].sum() == 0:
+             fii['ultimo_dividendo'] = (fii['preco_atual_r'] * (fii['dy_12m_acumulado'] / 100)) / 12
 
         # 3. APLICAÇÃO DOS FILTROS
         fii = fii[
@@ -91,7 +98,7 @@ def processar_carteira():
         if fii.empty:
             return jsonify({"aviso": "Nenhum fundo passou nos filtros selecionados."}), 200
 
-        # 4, 5, 6. CATEGORIZAÇÃO E PCA
+        # 4, 5, 6. CATEGORIZAÇÃO E PCA (QUALIDADE DO ATIVO)
         def categorizar_setor(s):
             s = str(s)
             if s in ["Papéis", "Serviços Financeiros Diversos"]: return "Papel"
@@ -140,50 +147,98 @@ def processar_carteira():
 
         fii_real['dist'] = fii_real.apply(calc_weighted_dist, axis=1)
 
-        # 7. ALOCAÇÃO
+        # ==============================================================================
+        # 7. ALOCAÇÃO OTIMIZADA VIA SOLVER (Knapsack Problem por Setor)
+        # ==============================================================================
+        
         carteira_final = []
 
         for setor, grupo in fii_real.groupby('macro_setor'):
-            n_para_este_setor = int(raw_top_n.get(setor, 3)) if isinstance(raw_top_n, dict) else int(raw_top_n)
-            melhores_do_setor = grupo.sort_values('dist').head(n_para_este_setor)
-            peso_alvo = PESOS_SETORIAIS.get(setor, 0)
-            budget = AMOUNT * peso_alvo
             
-            if budget > 0 and not melhores_do_setor.empty:
-                scores = 1 / (melhores_do_setor['dist'] + 1e-6)
-                pesos_rel = scores / scores.sum()
-                alocacao = budget * pesos_rel
-                qtd = np.floor(alocacao / melhores_do_setor['preco_atual_r'])
-                total = qtd * melhores_do_setor['preco_atual_r']
+            # 7.1 Define o Budget do Setor
+            peso_alvo = PESOS_SETORIAIS.get(setor, 0)
+            budget_disponivel = AMOUNT * peso_alvo
+            
+            # 7.2 Seleciona Candidatos (Filtro de Qualidade PCA)
+            # Pegamos os top 50 fundos mais "perfeitos" matematicamente.
+            # O Solver escolherá o time titular dentre esses 50.
+            pool_candidatos = grupo.sort_values('dist').head(50).copy()
+            
+            # Removemos fundos que não pagam dividendos (objetivo é renda)
+            pool_candidatos = pool_candidatos[pool_candidatos['dy_12m_acumulado'] > 0]
+
+            if budget_disponivel <= 0 or pool_candidatos.empty:
+                continue
+
+            # 7.3 Configura o Problema de Otimização
+            prob = LpProblem(f"Knapsack_{setor}", LpMaximize)
+            
+            tickers = pool_candidatos['ticker'].tolist()
+            precos = pool_candidatos.set_index('ticker')['preco_atual_r'].to_dict()
+            
+            # Calculamos o retorno FINANCEIRO esperado por cota (em R$)
+            # Usando DY anual para projeção: R$ Retorno = Preço * (DY% / 100)
+            retorno_em_reais = {}
+            for t, row in pool_candidatos.set_index('ticker').iterrows():
+                retorno_em_reais[t] = row['preco_atual_r'] * (row['dy_12m_acumulado'] / 100)
+
+            # Variáveis de Decisão: Quantidade de cotas (Inteiro >= 0)
+            qtd_vars = LpVariable.dicts("Qtd", tickers, lowBound=0, cat='Integer')
+
+            # --- FUNÇÃO OBJETIVO ---
+            # Maximizar o total de dinheiro recebido em dividendos (Renda Passiva)
+            prob += lpSum([qtd_vars[t] * retorno_em_reais[t] for t in tickers])
+
+            # --- RESTRIÇÃO DE ORÇAMENTO ---
+            # A soma das compras não pode exceder o budget do setor
+            prob += lpSum([qtd_vars[t] * precos[t] for t in tickers]) <= budget_disponivel
+
+            # Resolve o problema (Silencioso)
+            prob.solve(PULP_CBC_CMD(msg=False))
+
+            # 7.4 Compilação dos Resultados
+            max_dist_setor = pool_candidatos['dist'].max()
+            
+            for t in tickers:
+                qtd_otima = int(value(qtd_vars[t]))
                 
-                # Calculo Match Score
-                max_dist_setor = melhores_do_setor['dist'].max()
-                if max_dist_setor == 0:
-                    match_score_series = pd.Series(100.0, index=melhores_do_setor.index)
-                else:
-                    match_score_series = 100 * (1 - (melhores_do_setor['dist'] / max_dist_setor))
-                
-                match_score_series = match_score_series.clip(lower=0)
-                
-                res = melhores_do_setor[['fundos', 'macro_setor', 'preco_atual_r', 'dist', 'dy_12m_acumulado', 'p_vp']].copy()
-                res['qtd_cotas'] = qtd
-                res['total_investido'] = total
-                res['match_score'] = match_score_series.round(1) 
-                carteira_final.append(res)
+                if qtd_otima > 0:
+                    row = pool_candidatos[pool_candidatos['ticker'] == t].iloc[0]
+                    total_alocado = qtd_otima * row['preco_atual_r']
+                    
+                    # Score Visual (Informativo apenas)
+                    match_score = 100.0
+                    if max_dist_setor > 0:
+                         match_score = (100 * (1 - (row['dist'] / max_dist_setor))).round(1)
+
+                    res = {
+                        'fundos': row['fundos'],
+                        'ticker': t,
+                        'macro_setor': setor,
+                        'preco_atual_r': row['preco_atual_r'],
+                        'dy_12m_acumulado': row['dy_12m_acumulado'],
+                        'dist_pca': row['dist'],
+                        'qtd_cotas': qtd_otima,
+                        'total_investido': total_alocado,
+                        'match_score': match_score
+                    }
+                    carteira_final.append(res)
 
         if not carteira_final:
              return jsonify({"aviso": "Não foi possível alocar capital."}), 200
 
-        df_final = pd.concat(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
+        df_final = pd.DataFrame(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
         
-        # ### CORREÇÃO 2: SANITIZAÇÃO DE JSON ###
-        # O Pandas pode gerar NaN ou Infinity que quebram o n8n.
-        # Substituímos Infinito por 0 e NaN por 0 (ou None)
-        df_final = df_final.replace([np.inf, -np.inf], 0)
-        df_final = df_final.fillna(0)
+        # Sanitização Final
+        df_final = df_final.replace([np.inf, -np.inf], 0).fillna(0)
 
         INVESTIMENTO = round(float(df_final['total_investido'].sum()), 2)
         SOBRA = round(AMOUNT - INVESTIMENTO, 2)
+        
+        # Dy Médio Ponderado
+        dy_ponderado = 0
+        if INVESTIMENTO > 0:
+            dy_ponderado = (df_final['dy_12m_acumulado'] * df_final['total_investido']).sum() / INVESTIMENTO
 
         return jsonify({
             "carteira": df_final.to_dict(orient='records'),
@@ -191,12 +246,13 @@ def processar_carteira():
                 "aporte_inicial": AMOUNT,
                 "total_investido": INVESTIMENTO,
                 "sobra_caixa": SOBRA,
+                "dy_medio_carteira": round(dy_ponderado, 2),
+                "metodo": "Otimização Linear (Knapsack Problem)",
                 "filtros_utilizados": filtros_user
             }
         })
 
     except Exception as e:
-        # Imprime no log do servidor para você ver o erro real se acontecer
         print(traceback.format_exc()) 
         return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
