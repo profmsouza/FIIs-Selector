@@ -226,6 +226,7 @@ def processar_carteira():
                         'macro_setor': setor,
                         'preco_atual_r': row['preco_atual_r'],
                         'dy_12m_acumulado': row['dy_12m_acumulado'],
+                        'p_vp': row['p_vp'],
                         'dist_pca': row['dist'],
                         'qtd_cotas': qtd_otima,
                         'total_investido': total_alocado,
