@@ -11,12 +11,12 @@ import json
 
 app = Flask(__name__)
 
-# --- CONFIGURAÇÃO FIXA ---
-TOP_N_CANDIDATES = 10 
+# Configuração
+MIN_MATCH_SCORE = 50.0  # Só aceita ativos com mais de 50% de aderência ao ideal
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "API FIIs Online", "versao": "3.5 - Fix NaN Mask Error"})
+    return jsonify({"status": "API FIIs Online", "versao": "4.0 - Risk Adjusted Solver"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
@@ -27,7 +27,6 @@ def processar_carteira():
         if not content:
             return jsonify({"error": "Nenhum JSON recebido"}), 400
 
-        # Verifica se 'dados' existe
         dados_json = content.get('dados', [])
         
         if isinstance(dados_json, str):
@@ -88,7 +87,6 @@ def processar_carteira():
         if 'ticker' not in fii.columns:
              return jsonify({"error": "A coluna 'fundos' ou 'ticker' não foi encontrada nos dados."}), 400
         
-        # Garante que ticker é string e remove vazios
         fii['ticker'] = fii['ticker'].astype(str).str.strip()
 
         PESOS_PADRAO = {
@@ -109,7 +107,7 @@ def processar_carteira():
         if 'ultimo_dividendo' not in fii.columns or fii['ultimo_dividendo'].sum() == 0:
              fii['ultimo_dividendo'] = (fii['preco_atual_r'] * (fii['dy_12m_acumulado'] / 100)) / 12
 
-        # 3. APLICAÇÃO DOS FILTROS
+        # 3. APLICAÇÃO DOS FILTROS INICIAIS
         fii = fii[
             (fii['liquidez_diaria_r'] >= CORTE_LIQUIDEZ) &
             (fii['patrimonio_liquido'] >= CORTE_PATRIMONIO) &
@@ -144,7 +142,6 @@ def processar_carteira():
         agg_dict.update({c: 'max' for c in cols_max if c in fii.columns})
 
         fii_ref_setorial = fii.groupby('macro_setor').agg(agg_dict).reset_index()
-        # [CORREÇÃO AQUI]: Usamos 'ticker' para o target também, evitando colunas duplicadas com NaN
         fii_ref_setorial['ticker'] = "TGT_" + fii_ref_setorial['macro_setor']
         fii_ref_setorial['setor'] = fii_ref_setorial['macro_setor']
         
@@ -161,7 +158,6 @@ def processar_carteira():
         eigenvalues_weights = pca.explained_variance_ratio_
         fii_combined['pca_coords'] = list(X_pca)
 
-        # [CORREÇÃO AQUI]: Garantimos que não há NaNs na coluna ticker antes do startswith
         fii_combined['ticker'] = fii_combined['ticker'].fillna('')
         
         targets_coords = fii_combined[fii_combined['ticker'].str.startswith('TGT_')].set_index('macro_setor')['pca_coords']
@@ -176,7 +172,21 @@ def processar_carteira():
 
         fii_real['dist'] = fii_real.apply(calc_weighted_dist, axis=1)
 
-        # 7. ALOCAÇÃO
+        # === NOVIDADE: CÁLCULO DE MATCH SCORE GLOBAL (ANTES DO SOLVER) ===
+        # Para podermos filtrar e ponderar, precisamos do Score agora.
+        
+        # Agrupamos para pegar o max_dist de cada setor
+        max_dists = fii_real.groupby('macro_setor')['dist'].transform('max')
+        
+        # Evita divisão por zero se max_dist for 0
+        fii_real['match_score'] = np.where(
+            max_dists > 0, 
+            100 * (1 - (fii_real['dist'] / max_dists)), 
+            100.0
+        )
+        fii_real['match_score'] = fii_real['match_score'].round(1)
+
+        # 7. ALOCAÇÃO OTIMIZADA PONDERADA PELO RISCO (MATCH)
         carteira_final = []
 
         for setor, grupo in fii_real.groupby('macro_setor'):
@@ -184,32 +194,43 @@ def processar_carteira():
             peso_alvo = PESOS_SETORIAIS.get(setor, 0)
             budget_disponivel = AMOUNT * peso_alvo
             
-            # Shortlist PCA
-            pool_candidatos = grupo.sort_values('dist').head(TOP_N_CANDIDATES).copy()
+            # --- 7.1 FILTRO DE QUALIDADE (>50% Match) ---
+            # Aqui descartamos qualquer ativo que esteja estatisticamente muito longe do ideal
+            pool_candidatos = grupo[grupo['match_score'] >= MIN_MATCH_SCORE].copy()
             pool_candidatos = pool_candidatos[pool_candidatos['dy_12m_acumulado'] > 0]
 
             if budget_disponivel <= 0 or pool_candidatos.empty:
                 continue
 
-            # Solver Knapsack
-            prob = LpProblem(f"Knapsack_{setor}", LpMaximize)
+            # --- 7.2 SOLVER OTIMIZADO PELO MATCH ---
+            prob = LpProblem(f"Smart_Yield_{setor}", LpMaximize)
             
             tickers = pool_candidatos['ticker'].tolist()
             precos = pool_candidatos.set_index('ticker')['preco_atual_r'].to_dict()
+            scores = pool_candidatos.set_index('ticker')['match_score'].to_dict()
             
-            retorno_em_reais = {}
+            # CÁLCULO DA "UTILIDADE" DO ATIVO
+            # Objetivo: Maximizar (Dinheiro Recebido * Fator de Segurança)
+            # Fator de Segurança = Match Score / 100 (ex: 0.95, 0.60)
+            # Um fundo que paga R$ 1.00 mas tem Match 50% vale "0.50 pontos de utilidade"
+            # Um fundo que paga R$ 0.80 mas tem Match 90% vale "0.72 pontos de utilidade" (GANHA!)
+            utilidade_por_cota = {}
             for t, row in pool_candidatos.set_index('ticker').iterrows():
-                retorno_em_reais[t] = row['preco_atual_r'] * (row['dy_12m_acumulado'] / 100)
+                dividendo_anual_reais = row['preco_atual_r'] * (row['dy_12m_acumulado'] / 100)
+                fator_qualidade = row['match_score'] / 100.0
+                utilidade_por_cota[t] = dividendo_anual_reais * fator_qualidade
 
             qtd_vars = LpVariable.dicts("Qtd", tickers, lowBound=0, cat='Integer')
 
-            prob += lpSum([qtd_vars[t] * retorno_em_reais[t] for t in tickers])
+            # Função Objetivo: Maximizar a "Utilidade Ponderada" da Carteira
+            prob += lpSum([qtd_vars[t] * utilidade_por_cota[t] for t in tickers])
+
+            # Restrição: Respeitar o Bolso (Orçamento)
             prob += lpSum([qtd_vars[t] * precos[t] for t in tickers]) <= budget_disponivel
 
             prob.solve(PULP_CBC_CMD(msg=False))
 
-            max_dist_setor = pool_candidatos['dist'].max()
-            
+            # --- 7.3 COMPILAÇÃO ---
             for t in tickers:
                 qtd_otima = int(value(qtd_vars[t]))
                 
@@ -217,25 +238,20 @@ def processar_carteira():
                     row = pool_candidatos[pool_candidatos['ticker'] == t].iloc[0]
                     total_alocado = qtd_otima * row['preco_atual_r']
                     
-                    match_score = 100.0
-                    if max_dist_setor > 0:
-                         match_score = (100 * (1 - (row['dist'] / max_dist_setor))).round(1)
-
                     res = {
                         'fundos': t,
                         'macro_setor': setor,
                         'preco_atual_r': row['preco_atual_r'],
                         'dy_12m_acumulado': row['dy_12m_acumulado'],
-                        'p_vp': row['p_vp'],
                         'dist_pca': row['dist'],
+                        'match_score': row['match_score'], # Score real usado no cálculo
                         'qtd_cotas': qtd_otima,
-                        'total_investido': total_alocado,
-                        'match_score': match_score
+                        'total_investido': total_alocado
                     }
                     carteira_final.append(res)
 
         if not carteira_final:
-             return jsonify({"aviso": "Não foi possível alocar capital."}), 200
+             return jsonify({"aviso": "Não foi possível alocar capital com os filtros atuais."}), 200
 
         df_final = pd.DataFrame(carteira_final).sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
         df_final = df_final.replace([np.inf, -np.inf], 0).fillna(0)
@@ -243,6 +259,7 @@ def processar_carteira():
         INVESTIMENTO = round(float(df_final['total_investido'].sum()), 2)
         SOBRA = round(AMOUNT - INVESTIMENTO, 2)
         
+        # Dy Médio (Informativo, não ponderado pelo risco na exibição)
         dy_ponderado = 0
         if INVESTIMENTO > 0:
             dy_ponderado = (df_final['dy_12m_acumulado'] * df_final['total_investido']).sum() / INVESTIMENTO
@@ -254,7 +271,7 @@ def processar_carteira():
                 "total_investido": INVESTIMENTO,
                 "sobra_caixa": SOBRA,
                 "dy_medio_carteira": round(dy_ponderado, 2),
-                "metodo": "Híbrido: Top 10 PCA + Solver Knapsack",
+                "metodo": "Solver Ponderado: Max(Yield * MatchScore) | Min Match 50%",
                 "filtros_utilizados": filtros_user
             }
         })
