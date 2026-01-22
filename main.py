@@ -12,7 +12,7 @@ import json
 app = Flask(__name__)
 
 # Configuração
-MIN_MATCH_SCORE = 50.0  # Só aceita ativos com mais de 50% de aderência ao ideal
+MIN_MATCH_SCORE = 10.0  # Só aceita ativos com mais de 10% de aderência ao ideal
 
 @app.route('/', methods=['GET'])
 def health_check():
