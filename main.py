@@ -75,20 +75,22 @@ def safe_json_val(val):
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "Smart FII Round-Robin Online", "version": "8.0 - Human Logic"})
+    return jsonify({"status": "Smart FII Round-Robin Online", "version": "8.1 - Sorted by Match"})
 
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
     try:
-        # --- 1. PARSING ROBUSTO (Igual à versão anterior) ---
+        # --- 1. PARSING ROBUSTO (Compatível com n8n) ---
         raw_content = request.get_json()
         if not raw_content: return jsonify({"error": "Payload vazio."}), 400
 
         content = raw_content
+        # Se for lista, pega o primeiro item
         if isinstance(raw_content, list):
             if len(raw_content) > 0: content = raw_content[0]
             else: return jsonify({"error": "Lista vazia."}), 400
 
+        # Se tiver wrapper 'body', extrai o conteúdo
         if isinstance(content, dict) and 'body' in content:
             if isinstance(content['body'], dict): content = content['body']
             elif isinstance(content['body'], str):
@@ -108,7 +110,6 @@ def processar_carteira():
         filtros = content.get('filtros', {})
 
         # --- PREPARAÇÃO DATAFRAME ---
-        # Filtros
         MIN_LIQUIDEZ = safe_float(filtros.get('liquidez'), 0)
         MIN_PVP = safe_float(filtros.get('min_pvp'), 0)
         MAX_PVP = safe_float(filtros.get('max_pvp'), 999)
@@ -213,11 +214,9 @@ def processar_carteira():
             pool = candidatos[candidatos['macro_setor'] == setor].copy()
             if pool.empty: continue
 
-            # 2. Ordena pelos melhores scores e pega o TOP 3 (ou menos se não tiver 3)
+            # 2. Ordena pelos melhores scores e pega o TOP 3
             top_picks = pool.sort_values('match_score', ascending=False).head(3)
             
-            # Lista de dicionários para facilitar o loop de compra
-            # Precisamos controlar a quantidade comprada de cada um
             ativos_alvo = []
             for _, row in top_picks.iterrows():
                 ativos_alvo.append({
@@ -230,7 +229,6 @@ def processar_carteira():
                 })
             
             # 3. Loop de Compra (Round Robin)
-            # Enquanto houver dinheiro no budget do setor, tentamos comprar
             gastou_nesta_rodada = True
             
             while gastou_nesta_rodada:
@@ -240,18 +238,16 @@ def processar_carteira():
                 for ativo in ativos_alvo:
                     preco = ativo['preco']
                     
-                    # Se temos dinheiro para comprar mais uma cota
                     if budget_setor >= preco:
                         ativo['qtd'] += 1
                         budget_setor -= preco
-                        gastou_nesta_rodada = True # Continua o loop para tentar comprar mais
+                        gastou_nesta_rodada = True 
                     
-                    # Se o budget ficou muito pequeno, nem tenta os outros nessa rodada
                     if budget_setor < 1.0: 
                         gastou_nesta_rodada = False
                         break
 
-            # 4. Adiciona à carteira final apenas o que foi comprado
+            # 4. Adiciona à carteira final
             for ativo in ativos_alvo:
                 if ativo['qtd'] > 0:
                     carteira_final.append({
@@ -262,7 +258,7 @@ def processar_carteira():
                         "setor": setor,
                         "dy": float(ativo['dy']),
                         "p_vp": safe_json_val(ativo['p_vp']),
-                        "match_score": round(safe_json_val(ativo['score']),1)
+                        "match_score": safe_json_val(ativo['score'])
                     })
 
         df_res = pd.DataFrame(carteira_final)
@@ -274,10 +270,12 @@ def processar_carteira():
         total_inv = df_res['total'].sum()
         dy_pond = (df_res['dy'] * df_res['total']).sum() / total_inv if total_inv > 0 else 0
 
-        # Ordenação bonita
+        # ORDENAÇÃO POR SETOR E DEPOIS POR MATCH SCORE (Decrescente)
         ordem_setores = ["Papel", "Tijolo - Logística", "Tijolo - Renda Urbana", "Híbridos e Outros"]
         df_res['setor'] = pd.Categorical(df_res['setor'], categories=ordem_setores, ordered=True)
-        df_res = df_res.sort_values(['setor', 'total'], ascending=[True, False])
+        
+        # AQUI ESTÁ A ALTERAÇÃO SOLICITADA:
+        df_res = df_res.sort_values(['setor', 'match_score'], ascending=[True, False])
 
         return jsonify({
             "status": "sucesso",
