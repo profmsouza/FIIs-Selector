@@ -84,25 +84,48 @@ def health_check():
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
     try:
-        # 1. PARSING E TRATAMENTO DE LISTA (Correção para n8n)
+        # ==============================================================================
+        # 1. PARSING INTELIGENTE (Correção para o Wrapper 'body' do n8n)
+        # ==============================================================================
         raw_content = request.get_json()
         
         if not raw_content:
             return jsonify({"error": "Payload JSON vazio."}), 400
 
-        # CORREÇÃO CRÍTICA: Se o n8n enviar uma lista [Object], pegamos o primeiro item
         content = raw_content
-        if isinstance(raw_content, list):
-            if len(raw_content) > 0:
-                content = raw_content[0] # <--- AQUI ESTÁ A SOLUÇÃO
+
+        # 1. Se for Lista (n8n as vezes manda array de itens), pega o primeiro
+        if isinstance(content, list):
+            if len(content) > 0:
+                content = content[0]
             else:
                 return jsonify({"error": "Lista de entrada vazia."}), 400
 
-        # Extração de Dados e Parâmetros (Agora 'content' é garantidamente um dicionário)
+        # 2. Se tiver a chave 'body' (O PROBLEMA ATUAL), entra nela
+        # O n8n HTTP Request muitas vezes encapsula tudo em "body"
+        if isinstance(content, dict) and 'body' in content:
+            if isinstance(content['body'], dict):
+                content = content['body']
+            # Se 'body' for string (JSON stringificado), faz o parse
+            elif isinstance(content['body'], str):
+                try:
+                    content = json.loads(content['body'])
+                except:
+                    pass # Falha silenciosa, tenta usar o original
+
+        # ==============================================================================
+        # AGORA 'content' TEM OS DADOS LIMPOS
+        # ==============================================================================
+
+        # Extração de Dados e Parâmetros
         dados_json = content.get('dados', [])
         
         if not dados_json:
-            return jsonify({"error": "Lista de fundos ('dados') não fornecida ou vazia."}), 400
+            # Debug: mostra o que chegou para ajudar a entender se falhar
+            return jsonify({
+                "error": "Lista de fundos ('dados') não encontrada.",
+                "received_keys": list(content.keys())
+            }), 400
 
         AMOUNT = safe_float(content.get('amount'), 1000.0)
         
@@ -121,14 +144,12 @@ def processar_carteira():
         MIN_PVP = safe_float(filtros.get('min_pvp'), 0.80)
         MAX_PVP = safe_float(filtros.get('max_pvp'), 1.20)
         MIN_ATIVOS = safe_int(filtros.get('min_ativos'), 3)
-        
-        # Novos filtros que estavam faltando na sua lógica original
         MIN_PATRIMONIO = safe_float(filtros.get('patrimonio'), 0)
         MIN_COTISTAS = safe_int(filtros.get('cotistas'), 0)
         MIN_PRECO = safe_float(filtros.get('min_preco'), 0)
         MIN_VAR_PAT = safe_float(filtros.get('min_var_pat'), -999)
 
-        # Tratamento inteligente do DY (Aceita 8.0 ou 0.08 como 8%)
+        # Tratamento inteligente do DY
         raw_dy = safe_float(filtros.get('min_dy'), 6.0)
         MIN_DY = raw_dy * 100 if 0 < raw_dy < 1.0 else raw_dy
 
@@ -151,7 +172,7 @@ def processar_carteira():
 
         df['macro_setor'] = df['setor'].apply(categorizar_setor)
 
-        # 3. FILTRAGEM HARD (Aplicando TODOS os critérios)
+        # 3. FILTRAGEM HARD
         df_filtered = df[
             (df['liquidez_diaria_r'] >= MIN_LIQUIDEZ) &
             (df['patrimonio_liquido'] >= MIN_PATRIMONIO) &
@@ -175,10 +196,8 @@ def processar_carteira():
         valid_cols = [c for c in ALL_PCA_COLS if df_filtered[c].std() > 0]
         
         if len(valid_cols) < 2:
-            # Fallback se não houver dados suficientes para PCA
             df_filtered['match_score'] = 50.0 
         else:
-            # Treino apenas com dados reais
             X_real = df_filtered[valid_cols].copy()
             imputer = SimpleImputer(strategy='median')
             scaler = StandardScaler()
@@ -250,13 +269,9 @@ def processar_carteira():
             
             x = LpVariable.dicts("Qtd", tickers, lowBound=0, cat='Integer')
             
-            # Função Objetivo: Yield ajustado pelo Score
             prob += lpSum([x[t] * (yields[t] * (scores[t]/100.0)) for t in tickers])
-            
-            # Restrição Orçamentária
             prob += lpSum([x[t] * precos[t] for t in tickers]) <= budget
             
-            # Restrição de Concentração (Max 35% por ativo, se possível)
             if len(tickers) >= 3:
                 limite_ativo = budget * 0.35
                 for t in tickers:
@@ -282,7 +297,7 @@ def processar_carteira():
         df_res = pd.DataFrame(carteira_final)
         
         if df_res.empty:
-            return jsonify({"status": "aviso", "message": "Orçamento insuficiente para comprar cotas nos fundos selecionados."}), 200
+            return jsonify({"status": "aviso", "message": "Orçamento insuficiente para cotas."}), 200
             
         df_res = df_res.sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
         
@@ -305,9 +320,8 @@ def processar_carteira():
         return jsonify(response_payload)
 
     except Exception as e:
-        tracebox = traceback.format_exc()
-        print(tracebox) # Útil para debug no console do servidor
-        return jsonify({"error": "Erro interno no servidor.", "detalhes": str(e)}), 500
+        print(traceback.format_exc())
+        return jsonify({"error": "Erro interno.", "detalhes": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8000, debug=True)
