@@ -258,7 +258,7 @@ def processar_carteira():
                         "setor": setor,
                         "dy": float(ativo['dy']),
                         "p_vp": safe_json_val(ativo['p_vp']),
-                        "match_score": safe_json_val(ativo['score'])
+                        "match_score": round(safe_json_val(ativo['score']),1)
                     })
 
         df_res = pd.DataFrame(carteira_final)
