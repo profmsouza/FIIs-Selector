@@ -87,35 +87,23 @@ def health_check():
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
     try:
-        # 1. PARSING ROBUSTO (Correção para estrutura n8n e listas)
+        # 1. PARSING BLINDADO (Mantido da versão anterior)
         raw_content = request.get_json()
-        
-        if not raw_content:
-            return jsonify({"error": "Payload JSON vazio."}), 400
+        if not raw_content: return jsonify({"error": "Payload vazio."}), 400
 
         content = raw_content
+        if isinstance(raw_content, list):
+            if len(raw_content) > 0: content = raw_content[0]
+            else: return jsonify({"error": "Lista vazia."}), 400
 
-        # Se for lista (padrão n8n), pega o primeiro item
-        if isinstance(content, list):
-            if len(content) > 0:
-                content = content[0]
-            else:
-                return jsonify({"error": "Lista de entrada vazia."}), 400
-
-        # Se tiver encapsulado em 'body' (Webhook n8n), desenrola
         if isinstance(content, dict) and 'body' in content:
-            if isinstance(content['body'], dict):
-                content = content['body']
+            if isinstance(content['body'], dict): content = content['body']
             elif isinstance(content['body'], str):
-                try:
-                    content = json.loads(content['body'])
-                except:
-                    pass 
+                try: content = json.loads(content['body'])
+                except: pass
 
-        # Extração de Dados
         dados_json = content.get('dados', [])
-        if not dados_json:
-            return jsonify({"error": "Lista 'dados' não encontrada no JSON."}), 400
+        if not dados_json: return jsonify({"error": "Lista 'dados' ausente."}), 400
 
         # Parâmetros
         AMOUNT = safe_float(content.get('amount'), 1000.0)
@@ -126,22 +114,27 @@ def processar_carteira():
         pesos_usuario = content.get('pesos', PESOS_DEFAULT)
         filtros = content.get('filtros', {})
 
-        # 2. DATAFRAME E LIMPEZA
+        # --- FILTROS (Mantidos) ---
+        MIN_LIQUIDEZ = safe_float(filtros.get('liquidez'), 0)
+        MIN_PVP = safe_float(filtros.get('min_pvp'), 0)
+        MAX_PVP = safe_float(filtros.get('max_pvp'), 999)
+        MIN_ATIVOS = safe_int(filtros.get('min_ativos'), 0)
+        MIN_DY = safe_float(filtros.get('min_dy'), 0)
+        if 0 < MIN_DY < 1.0: MIN_DY *= 100
+        
+        MIN_PATRIMONIO = safe_float(filtros.get('patrimonio'), 0)
+        MIN_COTISTAS = safe_int(filtros.get('cotistas'), 0)
+        MIN_PRECO = safe_float(filtros.get('min_preco'), 0)
+        MIN_VAR_PAT = safe_float(filtros.get('min_var_pat'), -999)
+
+        # 2. DATAFRAME
         df = pd.DataFrame(dados_json)
-        
-        # Normaliza nomes das colunas (tudo minúsculo, sem espaço)
         df.columns = [c.strip().lower() for c in df.columns]
-        
-        # Garante coluna identificadora
         rename_map = {'fundos': 'ticker', 'ativo': 'ticker', 'codigo': 'ticker'}
         df = df.rename(columns=rename_map)
         
-        if 'ticker' not in df.columns:
-            return jsonify({"error": "Coluna 'ticker'/'fundos' obrigatória."}), 400
-        
-        # Garante coluna setor
-        if 'setor' not in df.columns:
-            df['setor'] = 'Indefinido'
+        if 'ticker' not in df.columns: return jsonify({"error": "Coluna 'ticker' obrigatória."}), 400
+        if 'setor' not in df.columns: df['setor'] = 'Indefinido'
 
         # Conversão Numérica
         cols_to_numeric = [c.lower() for c in ALL_PCA_COLS] + ['preco_atual_r', 'variacao_patrimonial']
@@ -151,24 +144,14 @@ def processar_carteira():
             else:
                 df[col] = 0.0
 
-        # 3. FILTRAGEM
-        MIN_LIQUIDEZ = safe_float(filtros.get('liquidez'), 0)
-        MIN_PVP = safe_float(filtros.get('min_pvp'), 0)
-        MAX_PVP = safe_float(filtros.get('max_pvp'), 999)
-        MIN_DY = safe_float(filtros.get('min_dy'), 0)
-        if 0 < MIN_DY < 1.0: MIN_DY *= 100 # Ajuste percentual
-        
-        MIN_PATRIMONIO = safe_float(filtros.get('patrimonio'), 0)
-        MIN_COTISTAS = safe_int(filtros.get('cotistas'), 0)
-        MIN_PRECO = safe_float(filtros.get('min_preco'), 0)
-        MIN_VAR_PAT = safe_float(filtros.get('min_var_pat'), -999)
-
+        # 3. APLICAÇÃO DOS FILTROS
         df_filtered = df[
             (df['liquidez_diaria_r'] >= MIN_LIQUIDEZ) &
             (df['patrimonio_liquido'] >= MIN_PATRIMONIO) &
             (df['num_cotistas'] >= MIN_COTISTAS) &
             (df['p_vp'] >= MIN_PVP) & (df['p_vp'] <= MAX_PVP) &
             (df['dy_12m_acumulado'] >= MIN_DY) &
+            (df['quant_ativos'] >= MIN_ATIVOS) &
             (df['preco_atual_r'] >= MIN_PRECO) &
             (df['variacao_patrimonial'] >= MIN_VAR_PAT)
         ].copy()
@@ -176,9 +159,8 @@ def processar_carteira():
         if df_filtered.empty:
             return jsonify({"status": "aviso", "message": "Nenhum fundo passou nos filtros."}), 200
 
-        # 4. PROCESSAMENTO (Categorização e PCA)
+        # 4. PCA E SCORE
         df_filtered['macro_setor'] = df_filtered['setor'].apply(categorizar_setor)
-        
         valid_cols = [c for c in df_filtered.columns if c in cols_to_numeric and df_filtered[c].std() > 0]
         
         if len(valid_cols) > 2:
@@ -193,7 +175,6 @@ def processar_carteira():
             eigenvalues = pca.explained_variance_ratio_
             df_filtered['coords'] = list(X_pca)
 
-            # Targets
             targets = []
             for setor, grupo in df_filtered.groupby('macro_setor'):
                 tgt = {'macro_setor': setor}
@@ -208,12 +189,9 @@ def processar_carteira():
             
             def calc_match(row):
                 t = target_map.get(row['macro_setor'])
-                if t is None: return 0.0
-                return np.sqrt(np.sum(((np.array(row['coords']) - t)**2) * eigenvalues))
+                return np.sqrt(np.sum(((np.array(row['coords']) - t)**2) * eigenvalues)) if t is not None else 0
 
             df_filtered['dist'] = df_filtered.apply(calc_match, axis=1)
-            
-            # Score
             df_filtered['max_dist'] = df_filtered.groupby('macro_setor')['dist'].transform('max')
             df_filtered['min_dist'] = df_filtered.groupby('macro_setor')['dist'].transform('min')
             
@@ -225,10 +203,11 @@ def processar_carteira():
             df_filtered['match_score'] = 50.0
 
         candidatos = df_filtered[df_filtered['match_score'] > 20].copy()
-        if candidatos.empty:
-             return jsonify({"status": "aviso", "message": "Score de qualidade baixo."}), 200
+        if candidatos.empty: return jsonify({"status": "aviso", "message": "Score de qualidade insuficiente."}), 200
 
-        # 5. SOLVER
+        # ==============================================================================
+        # 5. OTIMIZAÇÃO (SOLVER) - AGORA FOÇANDO O APORTE TOTAL
+        # ==============================================================================
         carteira_final = []
         
         for setor, peso in pesos_usuario.items():
@@ -245,15 +224,31 @@ def processar_carteira():
             
             x = LpVariable.dicts("Qtd", tickers, lowBound=0, cat='Integer')
             
-            # Maximizar (Yield * Score)
-            prob += lpSum([x[t] * (yields.get(t,0) * (scores.get(t,50)/100.0)) for t in tickers])
+            # --- NOVA FUNÇÃO OBJETIVO: MAXIMIZAR DIVIDENDOS TOTAIS EM REAIS ---
+            # Isso força o solver a gastar o dinheiro, pois dinheiro parado rende 0 dividendos.
+            # Fórmula: (Preço * Qtd) * (Yield/100) * (Fator de Qualidade)
             
-            # Budget
+            prob += lpSum([
+                x[t] * (precos[t] * (yields.get(t,0)/100.0) * (scores.get(t,50)/100.0)) 
+                for t in tickers
+            ])
+            
+            # Restrição do Budget
             prob += lpSum([x[t] * precos.get(t,0) for t in tickers]) <= budget
             
-            if len(tickers) >= 3:
-                limit = budget * 0.35
-                for t in tickers: prob += x[t] * precos.get(t,0) <= limit
+            # --- TRAVA DE CONCENTRAÇÃO DINÂMICA ---
+            # Resolve o problema de "sobra" quando há poucos ativos no setor
+            n_ativos = len(tickers)
+            
+            if n_ativos == 1:
+                limite_ativo = budget # 100% (All-in se for o único bom)
+            elif n_ativos == 2:
+                limite_ativo = budget * 0.60 # Permite gastar 100% combinando dois (60+40)
+            else:
+                limite_ativo = budget * 0.35 # Diversificação padrão
+                
+            for t in tickers: 
+                prob += x[t] * precos.get(t,0) <= limite_ativo
             
             prob.solve(PULP_CBC_CMD(msg=False))
             
@@ -261,7 +256,6 @@ def processar_carteira():
                 q = value(x[t])
                 if q and q > 0:
                     row = pool[pool['ticker'] == t].iloc[0]
-                    # AQUI ESTAVA O SEU PROBLEMA: Adicionar variáveis de forma segura
                     carteira_final.append({
                         "fundos": t,
                         "qtd": int(q),
@@ -269,17 +263,16 @@ def processar_carteira():
                         "total": round(q * row['preco_atual_r'], 2),
                         "setor": setor,
                         "dy": float(row.get('dy_12m_acumulado', 0)),
-                        "p_vp": safe_json_val(row.get('p_vp', 0)), # Protegido
-                        "match_score": safe_json_val(row.get('match_score', 0)) # Protegido
+                        "p_vp": safe_json_val(row.get('p_vp', 0)),
+                        "match_score": safe_json_val(row.get('match_score', 0))
                     })
 
         df_res = pd.DataFrame(carteira_final)
         
-        if df_res.empty:
-            return jsonify({"status": "aviso", "message": "Orçamento insuficiente."}), 200
+        if df_res.empty: return jsonify({"status": "aviso", "message": "Orçamento insuficiente."}), 200
 
-        # Totais
         total_inv = df_res['total'].sum()
+        # Calculo ponderado correto
         dy_pond = (df_res['dy'] * df_res['total']).sum() / total_inv if total_inv > 0 else 0
 
         return jsonify({
@@ -287,7 +280,7 @@ def processar_carteira():
             "resumo": {
                 "total_investido": round(total_inv, 2),
                 "sobra": round(AMOUNT - total_inv, 2),
-                "dy_medio": round(dy_pond, 2),
+                "dy_medio_carteira": round(dy_pond, 2),
                 "qtd_ativos": len(df_res)
             },
             "carteira": df_res.to_dict(orient='records')
@@ -295,7 +288,7 @@ def processar_carteira():
 
     except Exception as e:
         print(traceback.format_exc())
-        return jsonify({"error": "Erro interno no servidor.", "detalhes": str(e)}), 500
+        return jsonify({"error": "Erro interno.", "detalhes": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=8000, debug=True)
