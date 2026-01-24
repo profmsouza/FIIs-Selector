@@ -274,7 +274,7 @@ def processar_carteira():
                         "preco_atual_r": row['preco_atual_r'],
                         "qtd_cotas": int(qtd),
                         "total_investido": round(qtd * row['preco_atual_r'], 2),
-                        "macro_setor": setor,
+                        "macro_setor": row['macro_setor'],
                         "dy_12m_acumulado": row['dy_12m_acumulado'],                   
                         "p_vp": row['p_vp'],
                         "match_score": round(row['match_score'], 1)                       
