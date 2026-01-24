@@ -265,6 +265,7 @@ def processar_carteira():
                     carteira_final.append({
                         "fundos": t,
                         "qtd_cotas": int(q),
+                        "total": round(q * row['preco_atual_r'], 2),
                         "preco_atual_r": round(q * row['preco_atual_r'], 2),
                         "macro_setor": setor,
                         "dy_12m_acumulado": float(row.get('dy_12m_acumulado', 0)),
