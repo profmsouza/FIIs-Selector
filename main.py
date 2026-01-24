@@ -84,24 +84,28 @@ def health_check():
 @app.route('/processar_carteira', methods=['POST'])
 def processar_carteira():
     try:
-        # 1. PARSING E VALIDAÇÃO
-        content = request.get_json()
+        # 1. PARSING E TRATAMENTO DE LISTA (Correção para n8n)
+        raw_content = request.get_json()
         
-        if not content:
+        if not raw_content:
             return jsonify({"error": "Payload JSON vazio."}), 400
 
-        # Tratamento flexível para receber dados (suporta lista direta ou objeto com chave 'dados')
+        # CORREÇÃO CRÍTICA: Se o n8n enviar uma lista [Object], pegamos o primeiro item
+        content = raw_content
+        if isinstance(raw_content, list):
+            if len(raw_content) > 0:
+                content = raw_content[0] # <--- AQUI ESTÁ A SOLUÇÃO
+            else:
+                return jsonify({"error": "Lista de entrada vazia."}), 400
+
+        # Extração de Dados e Parâmetros (Agora 'content' é garantidamente um dicionário)
         dados_json = content.get('dados', [])
-        if not dados_json and isinstance(content, list):
-            dados_json = content
         
         if not dados_json:
-            return jsonify({"error": "Lista de fundos ('dados') não fornecida."}), 400
+            return jsonify({"error": "Lista de fundos ('dados') não fornecida ou vazia."}), 400
 
-        # Extração de Parâmetros
         AMOUNT = safe_float(content.get('amount'), 1000.0)
         
-        # Pesos Padrão (se não vier no JSON)
         PESOS_DEFAULT = {
             "Híbridos e Outros": 0.20,
             "Papel": 0.30,
@@ -110,13 +114,23 @@ def processar_carteira():
         }
         pesos_usuario = content.get('pesos', PESOS_DEFAULT)
         
-        # Filtros
+        # --- EXTRAÇÃO DE TODOS OS FILTROS ---
         filtros = content.get('filtros', {})
+        
         MIN_LIQUIDEZ = safe_float(filtros.get('liquidez'), 200000.0)
-        MIN_DY = safe_float(filtros.get('min_dy'), 6.0)
         MIN_PVP = safe_float(filtros.get('min_pvp'), 0.80)
         MAX_PVP = safe_float(filtros.get('max_pvp'), 1.20)
-        MIN_ATIVOS = safe_float(filtros.get('min_ativos'), 3)
+        MIN_ATIVOS = safe_int(filtros.get('min_ativos'), 3)
+        
+        # Novos filtros que estavam faltando na sua lógica original
+        MIN_PATRIMONIO = safe_float(filtros.get('patrimonio'), 0)
+        MIN_COTISTAS = safe_int(filtros.get('cotistas'), 0)
+        MIN_PRECO = safe_float(filtros.get('min_preco'), 0)
+        MIN_VAR_PAT = safe_float(filtros.get('min_var_pat'), -999)
+
+        # Tratamento inteligente do DY (Aceita 8.0 ou 0.08 como 8%)
+        raw_dy = safe_float(filtros.get('min_dy'), 6.0)
+        MIN_DY = raw_dy * 100 if 0 < raw_dy < 1.0 else raw_dy
 
         # 2. PREPARAÇÃO DO DATAFRAME
         df = pd.DataFrame(dados_json)
@@ -128,102 +142,95 @@ def processar_carteira():
         if 'ticker' not in df.columns:
             return jsonify({"error": "Coluna 'ticker' ou 'fundos' obrigatória."}), 400
 
-        # Conversão Numérica Robusta
-        cols_to_numeric = ALL_PCA_COLS + ['preco_atual_r']
+        cols_to_numeric = ALL_PCA_COLS + ['preco_atual_r', 'variacao_patrimonial']
         for col in cols_to_numeric:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
             else:
                 df[col] = 0.0
 
-        # Categorização
         df['macro_setor'] = df['setor'].apply(categorizar_setor)
 
-        # 3. FILTRAGEM HARD (Corte Inicial)
+        # 3. FILTRAGEM HARD (Aplicando TODOS os critérios)
         df_filtered = df[
             (df['liquidez_diaria_r'] >= MIN_LIQUIDEZ) &
-            (df['p_vp'] >= MIN_PVP) &
+            (df['patrimonio_liquido'] >= MIN_PATRIMONIO) &
+            (df['num_cotistas'] >= MIN_COTISTAS) &
+            (df['p_vp'] >= MIN_PVP) & 
             (df['p_vp'] <= MAX_PVP) &
             (df['dy_12m_acumulado'] >= MIN_DY) &
             (df['quant_ativos'] >= MIN_ATIVOS) &
-            (df['preco_atual_r'] > 0)
+            (df['preco_atual_r'] >= MIN_PRECO) &
+            (df['variacao_patrimonial'] >= MIN_VAR_PAT)
         ].copy()
 
         if df_filtered.empty:
-            return jsonify({"status": "aviso", "message": "Nenhum fundo passou nos filtros iniciais."}), 200
+            return jsonify({
+                "status": "aviso", 
+                "message": "Nenhum fundo passou nos filtros.",
+                "filtros_aplicados": filtros
+            }), 200
 
-        # 4. PCA E SCORE DE QUALIDADE (Latente & Robusto)
-        
-        # Identificar colunas com dados válidos (variância > 0)
+        # 4. PCA E SCORE (Latente)
         valid_cols = [c for c in ALL_PCA_COLS if df_filtered[c].std() > 0]
         
         if len(valid_cols) < 2:
-            return jsonify({"error": "Dados insuficientes para cálculo estatístico (colunas zeradas)."}), 400
-
-        # A) TREINO APENAS NOS DADOS REAIS
-        X_real = df_filtered[valid_cols].copy()
-        
-        imputer = SimpleImputer(strategy='median')
-        scaler = StandardScaler()
-        pca = PCA(n_components=0.95) # Explica 95% da variância
-        
-        X_imp = imputer.fit_transform(X_real)
-        X_sc = scaler.fit_transform(X_imp)
-        pca.fit(X_sc)
-        
-        # Coordenadas dos Reais
-        X_pca_real = pca.transform(X_sc)
-        eigenvalues = pca.explained_variance_ratio_
-        df_filtered['coords'] = list(X_pca_real)
-
-        # B) CRIAÇÃO DOS TARGETS (IDEAIS) VIA BOXPLOT
-        targets_data = []
-        for setor, grupo in df_filtered.groupby('macro_setor'):
-            tgt = {'macro_setor': setor}
-            for col in valid_cols:
-                if col in COLS_PCA_MIN:
-                    tgt[col] = get_robust_target(grupo[col], 'min')
-                else:
-                    tgt[col] = get_robust_target(grupo[col], 'max')
-            targets_data.append(tgt)
+            # Fallback se não houver dados suficientes para PCA
+            df_filtered['match_score'] = 50.0 
+        else:
+            # Treino apenas com dados reais
+            X_real = df_filtered[valid_cols].copy()
+            imputer = SimpleImputer(strategy='median')
+            scaler = StandardScaler()
+            pca = PCA(n_components=0.95)
             
-        df_tgt = pd.DataFrame(targets_data)
-        
-        # Projeção dos Targets (Latentes)
-        X_tgt = df_tgt[valid_cols]
-        X_tgt_imp = imputer.transform(X_tgt)
-        X_tgt_sc = scaler.transform(X_tgt_imp)
-        X_tgt_pca = pca.transform(X_tgt_sc)
-        
-        target_map = dict(zip(df_tgt['macro_setor'], X_tgt_pca))
+            X_imp = imputer.fit_transform(X_real)
+            X_sc = scaler.fit_transform(X_imp)
+            pca.fit(X_sc)
+            
+            X_pca_real = pca.transform(X_sc)
+            eigenvalues = pca.explained_variance_ratio_
+            df_filtered['coords'] = list(X_pca_real)
 
-        # C) CÁLCULO DO SCORE
-        def calc_match(row):
-            t_vec = target_map.get(row['macro_setor'])
-            if t_vec is None: return 0.0
-            r_vec = np.array(row['coords'])
-            # Distância Euclidiana Ponderada
-            dist = np.sqrt(np.sum(((r_vec - t_vec)**2) * eigenvalues))
-            return dist
+            # Targets Latentes
+            targets_data = []
+            for setor, grupo in df_filtered.groupby('macro_setor'):
+                tgt = {'macro_setor': setor}
+                for col in valid_cols:
+                    if col in COLS_PCA_MIN:
+                        tgt[col] = get_robust_target(grupo[col], 'min')
+                    else:
+                        tgt[col] = get_robust_target(grupo[col], 'max')
+                targets_data.append(tgt)
+                
+            df_tgt = pd.DataFrame(targets_data)
+            X_tgt = df_tgt[valid_cols]
+            X_tgt_imp = imputer.transform(X_tgt)
+            X_tgt_sc = scaler.transform(X_tgt_imp)
+            X_tgt_pca = pca.transform(X_tgt_sc)
+            
+            target_map = dict(zip(df_tgt['macro_setor'], X_tgt_pca))
 
-        df_filtered['dist'] = df_filtered.apply(calc_match, axis=1)
-        
-        # Normalização (0 a 100) por setor
-        df_filtered['max_dist'] = df_filtered.groupby('macro_setor')['dist'].transform('max')
-        df_filtered['min_dist'] = df_filtered.groupby('macro_setor')['dist'].transform('min')
-        
-        # Score = 100 se distância for mínima, 0 se for máxima (dentro do setor)
-        # Adicionamos small epsilon para evitar divisão por zero
-        df_filtered['match_score'] = 100 * (1 - (
-            (df_filtered['dist'] - df_filtered['min_dist']) / 
-            (df_filtered['max_dist'] - df_filtered['min_dist'] + 1e-9)
-        ))
-        
-        # Filtro de qualidade mínima para o Solver (Score > 30)
+            def calc_match(row):
+                t_vec = target_map.get(row['macro_setor'])
+                if t_vec is None: return 0.0
+                r_vec = np.array(row['coords'])
+                return np.sqrt(np.sum(((r_vec - t_vec)**2) * eigenvalues))
+
+            df_filtered['dist'] = df_filtered.apply(calc_match, axis=1)
+            
+            df_filtered['max_dist'] = df_filtered.groupby('macro_setor')['dist'].transform('max')
+            df_filtered['min_dist'] = df_filtered.groupby('macro_setor')['dist'].transform('min')
+            
+            df_filtered['match_score'] = 100 * (1 - (
+                (df_filtered['dist'] - df_filtered['min_dist']) / 
+                (df_filtered['max_dist'] - df_filtered['min_dist'] + 1e-9)
+            ))
+
         candidatos = df_filtered[df_filtered['match_score'] > 30].copy()
 
         if candidatos.empty:
-             return jsonify({"status": "aviso", "message": "Nenhum fundo atingiu o score mínimo de qualidade."}), 200
+             return jsonify({"status": "aviso", "message": "Nenhum fundo atingiu o score mínimo de qualidade (>30)."}), 200
 
         # 5. OTIMIZAÇÃO (SOLVER)
         carteira_final = []
@@ -234,37 +241,29 @@ def processar_carteira():
             
             if pool.empty or budget < 10:
                 continue
-                
-            # Configuração do Problema
+            
             prob = LpProblem(f"Otimizacao_{setor}", LpMaximize)
             tickers = pool['ticker'].tolist()
-            
-            # Mapas de dados para acesso rápido
             precos = pool.set_index('ticker')['preco_atual_r'].to_dict()
             yields = pool.set_index('ticker')['dy_12m_acumulado'].to_dict()
             scores = pool.set_index('ticker')['match_score'].to_dict()
             
-            # Variável de Decisão: Quantidade Inteira
             x = LpVariable.dicts("Qtd", tickers, lowBound=0, cat='Integer')
             
-            # OBJETIVO: Maximizar Yield Ponderado pela Qualidade
-            # Um fundo com Score 100 entrega 100% da sua utilidade (Yield)
-            # Um fundo com Score 50 entrega 50% da utilidade
+            # Função Objetivo: Yield ajustado pelo Score
             prob += lpSum([x[t] * (yields[t] * (scores[t]/100.0)) for t in tickers])
             
-            # RESTRIÇÃO 1: Orçamento
+            # Restrição Orçamentária
             prob += lpSum([x[t] * precos[t] for t in tickers]) <= budget
             
-            # RESTRIÇÃO 2: Concentração (Max 35% do budget em um ativo, se houver variedade)
+            # Restrição de Concentração (Max 35% por ativo, se possível)
             if len(tickers) >= 3:
                 limite_ativo = budget * 0.35
                 for t in tickers:
                     prob += x[t] * precos[t] <= limite_ativo
             
-            # Resolver
             prob.solve(PULP_CBC_CMD(msg=False))
             
-            # Coletar
             for t in tickers:
                 qtd = value(x[t])
                 if qtd and qtd > 0:
@@ -274,25 +273,22 @@ def processar_carteira():
                         "preco_atual_r": row['preco_atual_r'],
                         "qtd_cotas": int(qtd),
                         "total_investido": round(qtd * row['preco_atual_r'], 2),
-                        "macro_setor": row['macro_setor'],
-                        "dy_12m_acumulado": row['dy_12m_acumulado'],                   
+                        "macro_setor": setor,
+                        "dy_12m_acumulado": row['dy_12m_acumulado'],                    
                         "p_vp": row['p_vp'],
-                        "match_score": round(row['match_score'], 1)                       
+                        "match_score": round(row['match_score'], 1)                        
                     })
 
-        # 6. MONTAGEM DA RESPOSTA
         df_res = pd.DataFrame(carteira_final)
         
         if df_res.empty:
-            return jsonify({"status": "aviso", "message": "Não foi possível alocar capital (budget insuficiente para cotas)."}), 200
+            return jsonify({"status": "aviso", "message": "Orçamento insuficiente para comprar cotas nos fundos selecionados."}), 200
             
-        df_res = df_res.sort_values(['setor', 'total_investido'], ascending=[True, False])
+        df_res = df_res.sort_values(['macro_setor', 'total_investido'], ascending=[True, False])
         
         total_inv = df_res['total_investido'].sum()
         sobra = AMOUNT - total_inv
-        
-        # Yield Médio da Carteira
-        dy_ponderado = (df_res['dy_12m'] * df_res['total_investido']).sum() / total_inv
+        dy_ponderado = (df_res['dy_12m_acumulado'] * df_res['total_investido']).sum() / total_inv
 
         response_payload = {
             "status": "sucesso",
@@ -309,9 +305,8 @@ def processar_carteira():
         return jsonify(response_payload)
 
     except Exception as e:
-        # Em produção, use logging ao invés de print
         tracebox = traceback.format_exc()
-        print(tracebox)
+        print(tracebox) # Útil para debug no console do servidor
         return jsonify({"error": "Erro interno no servidor.", "detalhes": str(e)}), 500
 
 if __name__ == "__main__":
