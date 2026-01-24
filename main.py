@@ -270,13 +270,14 @@ def processar_carteira():
                 if qtd and qtd > 0:
                     row = pool[pool['ticker'] == t].iloc[0]
                     carteira_final.append({
-                        "ticker": t,
-                        "setor": setor,
+                        "fundos": t,
+                        "preco_atual_r": row['preco_atual_r'],
                         "qtd_cotas": int(qtd),
-                        "preco_medio": row['preco_atual_r'],
                         "total_investido": round(qtd * row['preco_atual_r'], 2),
-                        "match_score": round(row['match_score'], 1),
-                        "dy_12m": row['dy_12m_acumulado']
+                        "macro_setor": setor,
+                        "dy_12m_acumulado": row['dy_12m_acumulado'],                   
+                        "p_vp": row['p_vp'],
+                        "match_score": round(row['match_score'], 1)                       
                     })
 
         # 6. MONTAGEM DA RESPOSTA
