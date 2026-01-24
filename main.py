@@ -264,11 +264,11 @@ def processar_carteira():
                     # AQUI ESTAVA O SEU PROBLEMA: Adicionar variáveis de forma segura
                     carteira_final.append({
                         "fundos": t,
-                        "qtd_cotas": int(q),
+                        "qtd": int(q),
+                        "preco": float(row['preco_atual_r']),
                         "total": round(q * row['preco_atual_r'], 2),
-                        "preco_atual_r": round(q * row['preco_atual_r'], 2),
-                        "macro_setor": setor,
-                        "dy_12m_acumulado": float(row.get('dy_12m_acumulado', 0)),
+                        "setor": setor,
+                        "dy": float(row.get('dy_12m_acumulado', 0)),
                         "p_vp": safe_json_val(row.get('p_vp', 0)), # Protegido
                         "match_score": safe_json_val(row.get('match_score', 0)) # Protegido
                     })
